@@ -54,23 +54,18 @@ logger = logging.getLogger(__name__)
 
 db_pool = None
 
-# Пользователь -> ждём файл
 waiting_for_file = set()
-
-# Пользователь -> ждём код поиска
 searching_users = set()
 
-# Пользователь -> сообщения текущей страницы
-# Нужно для удаления предыдущей страницы перед показом новой
+# ID сообщений, составляющих текущую страницу
 page_messages = {}
-
-
-# ============================================================
-# КОНСТАНТЫ
-# ============================================================
 
 FILES_PER_PAGE = 10
 
+
+# ============================================================
+# КАТЕГОРИИ
+# ============================================================
 
 CATEGORY_NAMES = {
     "photo": "🖼️ Изображения",
@@ -88,6 +83,7 @@ CATEGORY_NAMES = {
 # ============================================================
 
 async def init_db():
+
     global db_pool
 
     db_pool = await asyncpg.create_pool(
@@ -97,6 +93,10 @@ async def init_db():
     )
 
     async with db_pool.acquire() as conn:
+
+        # ----------------------------------------------------
+        # СОЗДАНИЕ ТАБЛИЦЫ
+        # ----------------------------------------------------
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
@@ -114,7 +114,10 @@ async def init_db():
             )
         """)
 
-        # Для старой базы
+        # ----------------------------------------------------
+        # ДОБАВЛЕНИЕ КОЛОНОК ДЛЯ СТАРОЙ БАЗЫ
+        # ----------------------------------------------------
+
         await conn.execute("""
             ALTER TABLE files
             ADD COLUMN IF NOT EXISTS file_type TEXT
@@ -150,6 +153,10 @@ async def init_db():
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
         """)
 
+        # ----------------------------------------------------
+        # ИНДЕКСЫ
+        # ----------------------------------------------------
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_files_user_id
             ON files(user_id)
@@ -165,11 +172,73 @@ async def init_db():
             ON files(user_id, file_type)
         """)
 
-    logger.info("Database initialized")
+        # ====================================================
+        # МИГРАЦИЯ СТАРЫХ ФАЙЛОВ
+        # ====================================================
+
+        # Старые записи могли иметь NULL в file_type.
+        # Определяем их как документы либо архивы.
+        await conn.execute("""
+            UPDATE files
+            SET file_type = CASE
+                WHEN
+                    LOWER(COALESCE(file_name, '')) LIKE '%.zip'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.rar'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.7z'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.tar'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.gz'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.bz2'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.xz'
+                    OR LOWER(COALESCE(mime_type, '')) IN (
+                        'application/zip',
+                        'application/x-rar-compressed',
+                        'application/vnd.rar',
+                        'application/x-7z-compressed',
+                        'application/gzip',
+                        'application/x-tar'
+                    )
+                THEN 'archive'
+                ELSE 'document'
+            END
+            WHERE file_type IS NULL
+               OR file_type = ''
+        """)
+
+        # В старой версии GIF мог храниться как animation.
+        await conn.execute("""
+            UPDATE files
+            SET file_type = 'gif'
+            WHERE file_type = 'animation'
+        """)
+
+        # Если старый архив уже был определён как document,
+        # переводим его в категорию архивов по расширению.
+        await conn.execute("""
+            UPDATE files
+            SET file_type = 'archive'
+            WHERE file_type = 'document'
+              AND (
+                    LOWER(COALESCE(file_name, '')) LIKE '%.zip'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.rar'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.7z'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.tar'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.gz'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.bz2'
+                    OR LOWER(COALESCE(file_name, '')) LIKE '%.xz'
+              )
+        """)
+
+        logger.info(
+            "Old files migration completed"
+        )
+
+    logger.info(
+        "Database initialized"
+    )
 
 
 # ============================================================
-# CODE
+# CODE GENERATOR
 # ============================================================
 
 async def generate_code():
@@ -177,11 +246,17 @@ async def generate_code():
     while True:
 
         letters = "".join(
-            random.choices(string.ascii_uppercase, k=5)
+            random.choices(
+                string.ascii_uppercase,
+                k=5
+            )
         )
 
         numbers = "".join(
-            random.choices(string.digits, k=5)
+            random.choices(
+                string.digits,
+                k=5
+            )
         )
 
         code = f"{letters}-{numbers}"
@@ -189,7 +264,11 @@ async def generate_code():
         async with db_pool.acquire() as conn:
 
             exists = await conn.fetchval(
-                "SELECT 1 FROM files WHERE code = $1",
+                """
+                SELECT 1
+                FROM files
+                WHERE code = $1
+                """,
                 code
             )
 
@@ -221,7 +300,13 @@ def format_size(size):
 
     size = float(size)
 
-    units = ["B", "KB", "MB", "GB", "TB"]
+    units = [
+        "B",
+        "KB",
+        "MB",
+        "GB",
+        "TB"
+    ]
 
     for unit in units:
 
@@ -243,10 +328,16 @@ def get_icon(file_type):
         "voice": "🎤",
         "document": "📄",
         "archive": "📦",
-    }.get(file_type, "📁")
+    }.get(
+        file_type,
+        "📁"
+    )
 
 
-def normalize_file_type(file_type, file_name=None):
+def normalize_file_type(
+    file_type,
+    file_name=None
+):
 
     if file_type == "animation":
         return "gif"
@@ -254,7 +345,9 @@ def normalize_file_type(file_type, file_name=None):
     if file_type in CATEGORY_NAMES:
         return file_type
 
-    name = (file_name or "").lower()
+    name = (
+        file_name or ""
+    ).lower()
 
     archive_extensions = (
         ".zip",
@@ -269,11 +362,17 @@ def normalize_file_type(file_type, file_name=None):
         ".tar.bz2",
     )
 
-    if name.endswith(archive_extensions):
+    if name.endswith(
+        archive_extensions
+    ):
         return "archive"
 
     return "document"
 
+
+# ============================================================
+# FILE DATA
+# ============================================================
 
 def get_file_data(message: Message):
 
@@ -285,7 +384,9 @@ def get_file_data(message: Message):
 
         photo = message.photo[-1]
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.utcnow().strftime(
+            "%Y%m%d_%H%M%S"
+        )
 
         return {
             "file_type": "photo",
@@ -308,13 +409,19 @@ def get_file_data(message: Message):
             "file_type": "video",
             "file_id": video.file_id,
             "file_unique_id": video.file_unique_id,
-            "file_name": video.file_name or "video.mp4",
+            "file_name": (
+                video.file_name
+                or "video.mp4"
+            ),
             "file_size": video.file_size,
-            "mime_type": video.mime_type or "video/mp4",
+            "mime_type": (
+                video.mime_type
+                or "video/mp4"
+            ),
         }
 
     # --------------------------------------------------------
-    # GIF / ANIMATION
+    # GIF
     # --------------------------------------------------------
 
     if message.animation:
@@ -325,9 +432,15 @@ def get_file_data(message: Message):
             "file_type": "gif",
             "file_id": animation.file_id,
             "file_unique_id": animation.file_unique_id,
-            "file_name": animation.file_name or "animation.gif",
+            "file_name": (
+                animation.file_name
+                or "animation.gif"
+            ),
             "file_size": animation.file_size,
-            "mime_type": animation.mime_type or "image/gif",
+            "mime_type": (
+                animation.mime_type
+                or "image/gif"
+            ),
         }
 
     # --------------------------------------------------------
@@ -342,9 +455,15 @@ def get_file_data(message: Message):
             "file_type": "audio",
             "file_id": audio.file_id,
             "file_unique_id": audio.file_unique_id,
-            "file_name": audio.file_name or "audio.mp3",
+            "file_name": (
+                audio.file_name
+                or "audio.mp3"
+            ),
             "file_size": audio.file_size,
-            "mime_type": audio.mime_type or "audio/mpeg",
+            "mime_type": (
+                audio.mime_type
+                or "audio/mpeg"
+            ),
         }
 
     # --------------------------------------------------------
@@ -372,7 +491,10 @@ def get_file_data(message: Message):
 
         document = message.document
 
-        file_name = document.file_name or "document"
+        file_name = (
+            document.file_name
+            or "document"
+        )
 
         file_type = normalize_file_type(
             "document",
@@ -455,10 +577,10 @@ def home_keyboard():
 
 async def cmd_start(message: Message):
 
-    text = (
+    await message.answer(
         "📁 <b>Файловый Менеджер</b>\n\n"
         "Добро пожаловать!\n\n"
-        "Я могу сохранять практически любые файлы:\n\n"
+        "Я могу сохранять:\n\n"
         "🖼️ Изображения\n"
         "🎥 Видео\n"
         "🎞️ GIF\n"
@@ -466,11 +588,7 @@ async def cmd_start(message: Message):
         "🎤 Голосовые\n"
         "📄 Документы\n"
         "📦 Архивы\n\n"
-        "Выбери нужное действие:"
-    )
-
-    await message.answer(
-        text,
+        "Выбери действие:",
         reply_markup=main_menu()
     )
 
@@ -479,10 +597,24 @@ async def cmd_start(message: Message):
 # HOME
 # ============================================================
 
-async def show_home(callback: CallbackQuery):
+async def show_home(
+    callback: CallbackQuery
+):
 
-    waiting_for_file.discard(callback.from_user.id)
-    searching_users.discard(callback.from_user.id)
+    user_id = callback.from_user.id
+
+    waiting_for_file.discard(
+        user_id
+    )
+
+    searching_users.discard(
+        user_id
+    )
+
+    await clear_page_messages(
+        callback.bot,
+        user_id
+    )
 
     await callback.message.edit_text(
         "📁 <b>Файловый Менеджер</b>\n\n"
@@ -497,11 +629,15 @@ async def show_home(callback: CallbackQuery):
 # UPLOAD
 # ============================================================
 
-async def upload_start(callback: CallbackQuery):
+async def upload_start(
+    callback: CallbackQuery
+):
 
     user_id = callback.from_user.id
 
-    waiting_for_file.add(user_id)
+    waiting_for_file.add(
+        user_id
+    )
 
     await callback.message.edit_text(
         "📤 <b>Загрузка файла</b>\n\n"
@@ -533,11 +669,15 @@ async def upload_start(callback: CallbackQuery):
 # SAVE FILE
 # ============================================================
 
-async def save_file(message: Message):
+async def save_file(
+    message: Message
+):
 
     user_id = message.from_user.id
 
-    data = get_file_data(message)
+    data = get_file_data(
+        message
+    )
 
     if not data:
         return False
@@ -572,47 +712,46 @@ async def save_file(message: Message):
             data["file_type"],
         )
 
-    waiting_for_file.discard(user_id)
+    waiting_for_file.discard(
+        user_id
+    )
 
-    icon = get_icon(data["file_type"])
+    icon = get_icon(
+        data["file_type"]
+    )
 
-    text = (
+    await message.answer(
         f"{icon} <b>Файл сохранён!</b>\n\n"
         f"📄 <b>Имя:</b> "
         f"{escape_html(data['file_name'])}\n"
         f"📦 <b>Размер:</b> "
         f"{format_size(data['file_size'])}\n"
-        f"🔑 <b>Код:</b> <code>{code}</code>\n\n"
-        "Файл теперь находится в разделе "
-        f"{CATEGORY_NAMES[data['file_type']]}."
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📥 Получить",
-                    callback_data=f"get:{code}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📂 Мои файлы",
-                    callback_data="myfiles"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏠 Главное меню",
-                    callback_data="home"
-                )
+        f"🔑 <b>Код:</b> "
+        f"<code>{code}</code>\n\n"
+        f"Файл находится в разделе "
+        f"<b>{CATEGORY_NAMES[data['file_type']]}</b>.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📥 Получить",
+                        callback_data=f"get:{code}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📂 Мои файлы",
+                        callback_data="myfiles"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home"
+                    )
+                ]
             ]
-        ]
-    )
-
-    await message.answer(
-        text,
-        reply_markup=keyboard
+        )
     )
 
     logger.info(
@@ -630,7 +769,9 @@ async def save_file(message: Message):
 # FILE HANDLER
 # ============================================================
 
-async def handle_file(message: Message):
+async def handle_file(
+    message: Message
+):
 
     user_id = message.from_user.id
 
@@ -645,18 +786,37 @@ async def handle_file(message: Message):
 
         return
 
-    await save_file(message)
+    await save_file(
+        message
+    )
 
 
 # ============================================================
-# CATEGORY MENU
+# MY FILES
 # ============================================================
 
-async def my_files(callback: CallbackQuery):
+async def my_files(
+    callback: CallbackQuery
+):
 
     user_id = callback.from_user.id
 
     async with db_pool.acquire() as conn:
+
+        # Перед показом категорий ещё раз исправляем
+        # старые NULL/animation записи.
+        await conn.execute("""
+            UPDATE files
+            SET file_type = 'document'
+            WHERE file_type IS NULL
+               OR file_type = ''
+        """)
+
+        await conn.execute("""
+            UPDATE files
+            SET file_type = 'gif'
+            WHERE file_type = 'animation'
+        """)
 
         rows = await conn.fetch(
             """
@@ -672,14 +832,17 @@ async def my_files(callback: CallbackQuery):
 
     for row in rows:
 
-        normalized = normalize_file_type(
+        file_type = normalize_file_type(
             row["file_type"]
         )
 
-        counts[normalized] = counts.get(
-            normalized,
-            0
-        ) + int(row["count"])
+        counts[file_type] = (
+            counts.get(
+                file_type,
+                0
+            )
+            + int(row["count"])
+        )
 
     buttons = []
 
@@ -693,12 +856,20 @@ async def my_files(callback: CallbackQuery):
         "archive",
     ):
 
-        count = counts.get(file_type, 0)
+        count = counts.get(
+            file_type,
+            0
+        )
 
         buttons.append([
             InlineKeyboardButton(
-                text=f"{CATEGORY_NAMES[file_type]} — {count}",
-                callback_data=f"category:{file_type}:1"
+                text=(
+                    f"{CATEGORY_NAMES[file_type]}"
+                    f" — {count}"
+                ),
+                callback_data=(
+                    f"category:{file_type}:1"
+                )
             )
         ])
 
@@ -721,12 +892,18 @@ async def my_files(callback: CallbackQuery):
 
 
 # ============================================================
-# DELETE OLD PAGE
+# CLEAR PAGE
 # ============================================================
 
-async def clear_page_messages(bot: Bot, user_id: int):
+async def clear_page_messages(
+    bot: Bot,
+    user_id: int
+):
 
-    ids = page_messages.get(user_id, [])
+    ids = page_messages.get(
+        user_id,
+        []
+    )
 
     if not ids:
         return
@@ -758,16 +935,76 @@ async def show_category_page(
 
     user_id = callback.from_user.id
 
-    # Сначала отвечаем на callback
+    file_type = normalize_file_type(
+        file_type
+    )
+
+    # --------------------------------------------------------
+    # МИГРАЦИЯ СТАРЫХ ФАЙЛОВ ПЕРЕД ПОИСКОМ
+    # --------------------------------------------------------
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute("""
+            UPDATE files
+            SET file_type = 'document'
+            WHERE file_type IS NULL
+               OR file_type = ''
+        """)
+
+        await conn.execute("""
+            UPDATE files
+            SET file_type = 'gif'
+            WHERE file_type = 'animation'
+        """)
+
     await callback.answer()
 
-    # Удаляем старую страницу
     await clear_page_messages(
         callback.bot,
         user_id
     )
 
-    offset = (page - 1) * FILES_PER_PAGE
+    # --------------------------------------------------------
+    # КОЛИЧЕСТВО
+    # --------------------------------------------------------
+
+    async with db_pool.acquire() as conn:
+
+        total = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM files
+            WHERE user_id = $1
+              AND file_type = $2
+            """,
+            user_id,
+            file_type
+        )
+
+    total = int(
+        total or 0
+    )
+
+    pages = max(
+        1,
+        ceil(
+            total / FILES_PER_PAGE
+        )
+    )
+
+    page = max(
+        1,
+        min(page, pages)
+    )
+
+    offset = (
+        page - 1
+    ) * FILES_PER_PAGE
+
+    # --------------------------------------------------------
+    # ФАЙЛЫ
+    # --------------------------------------------------------
 
     async with db_pool.acquire() as conn:
 
@@ -785,7 +1022,7 @@ async def show_category_page(
                 created_at
             FROM files
             WHERE user_id = $1
-            AND file_type = $2
+              AND file_type = $2
             ORDER BY created_at DESC
             LIMIT $3
             OFFSET $4
@@ -796,29 +1033,9 @@ async def show_category_page(
             offset
         )
 
-        total = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM files
-            WHERE user_id = $1
-            AND file_type = $2
-            """,
-            user_id,
-            file_type
-        )
-
-    total = int(total or 0)
-
-    pages = max(
-        1,
-        ceil(total / FILES_PER_PAGE)
-    )
-
-    if page < 1:
-        page = 1
-
-    if page > pages:
-        page = pages
+    # --------------------------------------------------------
+    # ПУСТО
+    # --------------------------------------------------------
 
     if not rows:
 
@@ -830,7 +1047,7 @@ async def show_category_page(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="⬅️ Назад",
+                            text="⬅️ Категории",
                             callback_data="myfiles"
                         )
                     ],
@@ -844,14 +1061,16 @@ async def show_category_page(
             )
         )
 
-        page_messages[user_id] = [sent.message_id]
+        page_messages[user_id] = [
+            sent.message_id
+        ]
 
         return
 
     sent_ids = []
 
     # --------------------------------------------------------
-    # ОТПРАВЛЯЕМ ФАЙЛЫ
+    # ОТОБРАЖЕНИЕ ФАЙЛОВ
     # --------------------------------------------------------
 
     for row in rows:
@@ -861,25 +1080,43 @@ async def show_category_page(
             row["file_name"]
         )
 
-        icon = get_icon(real_type)
+        icon = get_icon(
+            real_type
+        )
 
-        name = row["file_name"] or "Без имени"
+        name = (
+            row["file_name"]
+            or "Без имени"
+        )
 
         if len(name) > 80:
-            name = name[:77] + "..."
+
+            name = (
+                name[:77]
+                + "..."
+            )
 
         created = row["created_at"]
 
-        if isinstance(created, datetime):
+        if isinstance(
+            created,
+            datetime
+        ):
+
             created = created.strftime(
                 "%d.%m.%Y %H:%M"
             )
 
         caption = (
-            f"{icon} <b>{escape_html(name)}</b>\n\n"
-            f"📦 Размер: {format_size(row['file_size'])}\n"
-            f"🔑 Код: <code>{row['code']}</code>\n"
-            f"📥 Скачиваний: {row['downloads']}\n"
+            f"{icon} <b>"
+            f"{escape_html(name)}"
+            f"</b>\n\n"
+            f"📦 Размер: "
+            f"{format_size(row['file_size'])}\n"
+            f"🔑 Код: "
+            f"<code>{row['code']}</code>\n"
+            f"📥 Скачиваний: "
+            f"{row['downloads']}\n"
             f"📅 {created}"
         )
 
@@ -888,17 +1125,23 @@ async def show_category_page(
                 [
                     InlineKeyboardButton(
                         text="📥 Получить",
-                        callback_data=f"get:{row['code']}"
+                        callback_data=(
+                            f"get:{row['code']}"
+                        )
                     ),
                     InlineKeyboardButton(
                         text="ℹ️ Инфо",
-                        callback_data=f"info:{row['code']}"
+                        callback_data=(
+                            f"info:{row['code']}"
+                        )
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="🗑️ Удалить",
-                        callback_data=f"delete:{row['code']}"
+                        callback_data=(
+                            f"delete:{row['code']}"
+                        )
                     )
                 ]
             ]
@@ -959,24 +1202,29 @@ async def show_category_page(
                     reply_markup=keyboard
                 )
 
-            sent_ids.append(sent.message_id)
+            sent_ids.append(
+                sent.message_id
+            )
 
-        except Exception as e:
+        except Exception:
 
             logger.exception(
-                "Failed to display file %s",
+                "Failed to display %s",
                 row["code"]
             )
 
             sent = await callback.bot.send_message(
                 user_id,
                 "⚠️ Не удалось показать файл\n\n"
-                f"🔑 Код: <code>{row['code']}</code>\n"
+                f"🔑 Код: "
+                f"<code>{row['code']}</code>\n"
                 f"📄 {escape_html(name)}",
                 reply_markup=keyboard
             )
 
-            sent_ids.append(sent.message_id)
+            sent_ids.append(
+                sent.message_id
+            )
 
     # --------------------------------------------------------
     # НАВИГАЦИЯ
@@ -989,7 +1237,11 @@ async def show_category_page(
         nav_buttons.append(
             InlineKeyboardButton(
                 text="⬅️",
-                callback_data=f"category:{file_type}:{page - 1}"
+                callback_data=(
+                    f"category:"
+                    f"{file_type}:"
+                    f"{page - 1}"
+                )
             )
         )
 
@@ -1005,39 +1257,45 @@ async def show_category_page(
         nav_buttons.append(
             InlineKeyboardButton(
                 text="➡️",
-                callback_data=f"category:{file_type}:{page + 1}"
+                callback_data=(
+                    f"category:"
+                    f"{file_type}:"
+                    f"{page + 1}"
+                )
             )
         )
 
-    nav_keyboard = [
-        nav_buttons,
-        [
-            InlineKeyboardButton(
-                text="📂 Категории",
-                callback_data="myfiles"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🏠 Главное меню",
-                callback_data="home"
-            )
-        ]
-    ]
-
-    nav = await callback.bot.send_message(
+    navigation = await callback.bot.send_message(
         user_id,
         f"{CATEGORY_NAMES[file_type]}\n\n"
-        f"📄 Показано {offset + 1}–"
+        f"📄 Показано "
+        f"{offset + 1}–"
         f"{min(offset + len(rows), total)} "
         f"из {total}\n\n"
-        f"Страница <b>{page}</b> из <b>{pages}</b>",
+        f"Страница "
+        f"<b>{page}</b> из <b>{pages}</b>",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=nav_keyboard
+            inline_keyboard=[
+                nav_buttons,
+                [
+                    InlineKeyboardButton(
+                        text="📂 Категории",
+                        callback_data="myfiles"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home"
+                    )
+                ]
+            ]
         )
     )
 
-    sent_ids.append(nav.message_id)
+    sent_ids.append(
+        navigation.message_id
+    )
 
     page_messages[user_id] = sent_ids
 
@@ -1046,7 +1304,9 @@ async def show_category_page(
 # NOOP
 # ============================================================
 
-async def noop(callback: CallbackQuery):
+async def noop(
+    callback: CallbackQuery
+):
 
     await callback.answer()
 
@@ -1055,9 +1315,14 @@ async def noop(callback: CallbackQuery):
 # GET FILE
 # ============================================================
 
-async def get_file(callback: CallbackQuery):
+async def get_file(
+    callback: CallbackQuery
+):
 
-    code = callback.data.split(":", 1)[1]
+    code = callback.data.split(
+        ":",
+        1
+    )[1]
 
     async with db_pool.acquire() as conn:
 
@@ -1103,9 +1368,9 @@ async def get_file(callback: CallbackQuery):
                 callback.from_user.id,
                 row["file_id"],
                 caption=(
-                    f"🖼️ <b>"
+                    "🖼️ <b>"
                     f"{escape_html(row['file_name'])}"
-                    f"</b>\n"
+                    "</b>\n"
                     f"🔑 <code>{row['code']}</code>"
                 )
             )
@@ -1116,9 +1381,9 @@ async def get_file(callback: CallbackQuery):
                 callback.from_user.id,
                 row["file_id"],
                 caption=(
-                    f"🎥 <b>"
+                    "🎥 <b>"
                     f"{escape_html(row['file_name'])}"
-                    f"</b>\n"
+                    "</b>\n"
                     f"🔑 <code>{row['code']}</code>"
                 )
             )
@@ -1129,9 +1394,9 @@ async def get_file(callback: CallbackQuery):
                 callback.from_user.id,
                 row["file_id"],
                 caption=(
-                    f"🎞️ <b>"
+                    "🎞️ <b>"
                     f"{escape_html(row['file_name'])}"
-                    f"</b>\n"
+                    "</b>\n"
                     f"🔑 <code>{row['code']}</code>"
                 )
             )
@@ -1142,9 +1407,9 @@ async def get_file(callback: CallbackQuery):
                 callback.from_user.id,
                 row["file_id"],
                 caption=(
-                    f"🎵 <b>"
+                    "🎵 <b>"
                     f"{escape_html(row['file_name'])}"
-                    f"</b>\n"
+                    "</b>\n"
                     f"🔑 <code>{row['code']}</code>"
                 )
             )
@@ -1162,19 +1427,21 @@ async def get_file(callback: CallbackQuery):
                 callback.from_user.id,
                 row["file_id"],
                 caption=(
-                    f"📄 <b>"
+                    "📄 <b>"
                     f"{escape_html(row['file_name'])}"
-                    f"</b>\n"
+                    "</b>\n"
                     f"🔑 <code>{row['code']}</code>"
                 )
             )
 
-        await callback.answer("✅ Файл отправлен")
+        await callback.answer(
+            "✅ Файл отправлен"
+        )
 
     except Exception:
 
         logger.exception(
-            "Failed to send file %s",
+            "Failed to send %s",
             code
         )
 
@@ -1188,22 +1455,20 @@ async def get_file(callback: CallbackQuery):
 # INFO
 # ============================================================
 
-async def info_file(callback: CallbackQuery):
+async def info_file(
+    callback: CallbackQuery
+):
 
-    code = callback.data.split(":", 1)[1]
+    code = callback.data.split(
+        ":",
+        1
+    )[1]
 
     async with db_pool.acquire() as conn:
 
         row = await conn.fetchrow(
             """
-            SELECT
-                code,
-                file_name,
-                file_size,
-                mime_type,
-                file_type,
-                downloads,
-                created_at
+            SELECT *
             FROM files
             WHERE code = $1
             """,
@@ -1219,16 +1484,21 @@ async def info_file(callback: CallbackQuery):
 
         return
 
-    real_type = normalize_file_type(
+    file_type = normalize_file_type(
         row["file_type"],
         row["file_name"]
     )
 
-    icon = get_icon(real_type)
+    icon = get_icon(
+        file_type
+    )
 
     created = row["created_at"]
 
-    if isinstance(created, datetime):
+    if isinstance(
+        created,
+        datetime
+    ):
 
         created = created.strftime(
             "%d.%m.%Y %H:%M"
@@ -1241,7 +1511,7 @@ async def info_file(callback: CallbackQuery):
         f"📦 <b>Размер:</b> "
         f"{format_size(row['file_size'])}\n"
         f"🔧 <b>Тип:</b> "
-        f"{escape_html(real_type)}\n"
+        f"{escape_html(file_type)}\n"
         f"📝 <b>MIME:</b> "
         f"{escape_html(row['mime_type'] or 'Неизвестно')}\n"
         f"🔑 <b>Код:</b> "
@@ -1252,8 +1522,11 @@ async def info_file(callback: CallbackQuery):
         f"{created}"
     )
 
-    await callback.message.edit_caption(
-        caption=text,
+    # Для информации удобнее отправить отдельное сообщение,
+    # чтобы оно одинаково работало и для документов,
+    # и для фотографий/видео.
+    await callback.message.answer(
+        text,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1267,12 +1540,6 @@ async def info_file(callback: CallbackQuery):
                         text="🗑️ Удалить",
                         callback_data=f"delete:{code}"
                     )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="📂 Категория",
-                        callback_data=f"backfile:{real_type}"
-                    )
                 ]
             ]
         )
@@ -1285,28 +1552,35 @@ async def info_file(callback: CallbackQuery):
 # DELETE
 # ============================================================
 
-async def delete_start(callback: CallbackQuery):
+async def delete_start(
+    callback: CallbackQuery
+):
 
-    code = callback.data.split(":", 1)[1]
+    code = callback.data.split(
+        ":",
+        1
+    )[1]
 
-    await callback.message.edit_caption(
-        caption=(
-            "⚠️ <b>Удаление файла</b>\n\n"
-            f"Ты действительно хочешь удалить "
-            f"<code>{code}</code>?"
-        ),
+    await callback.message.answer(
+        "⚠️ <b>Удаление файла</b>\n\n"
+        f"Ты действительно хочешь удалить "
+        f"<code>{code}</code>?",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
                         text="✅ Да, удалить",
-                        callback_data=f"confirm_delete:{code}"
+                        callback_data=(
+                            f"confirm_delete:{code}"
+                        )
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="❌ Отмена",
-                        callback_data=f"get:{code}"
+                        callback_data=(
+                            f"get:{code}"
+                        )
                     )
                 ]
             ]
@@ -1316,9 +1590,14 @@ async def delete_start(callback: CallbackQuery):
     await callback.answer()
 
 
-async def confirm_delete(callback: CallbackQuery):
+async def confirm_delete(
+    callback: CallbackQuery
+):
 
-    code = callback.data.split(":", 1)[1]
+    code = callback.data.split(
+        ":",
+        1
+    )[1]
 
     user_id = callback.from_user.id
 
@@ -1326,7 +1605,7 @@ async def confirm_delete(callback: CallbackQuery):
 
         row = await conn.fetchrow(
             """
-            SELECT user_id, file_name, file_type
+            SELECT user_id
             FROM files
             WHERE code = $1
             """,
@@ -1359,11 +1638,9 @@ async def confirm_delete(callback: CallbackQuery):
             code
         )
 
-    await callback.message.edit_caption(
-        caption=(
-            "🗑️ <b>Файл удалён</b>\n\n"
-            f"<code>{code}</code> больше недоступен."
-        ),
+    await callback.message.answer(
+        "🗑️ <b>Файл удалён</b>\n\n"
+        f"<code>{code}</code> больше недоступен.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1382,14 +1659,18 @@ async def confirm_delete(callback: CallbackQuery):
         )
     )
 
-    await callback.answer("Удалено")
+    await callback.answer(
+        "Удалено"
+    )
 
 
 # ============================================================
 # SEARCH
 # ============================================================
 
-async def search_start(callback: CallbackQuery):
+async def search_start(
+    callback: CallbackQuery
+):
 
     searching_users.add(
         callback.from_user.id
@@ -1415,14 +1696,18 @@ async def search_start(callback: CallbackQuery):
     await callback.answer()
 
 
-async def process_search(message: Message):
+async def process_search(
+    message: Message
+):
 
     user_id = message.from_user.id
 
     if user_id not in searching_users:
         return False
 
-    searching_users.discard(user_id)
+    searching_users.discard(
+        user_id
+    )
 
     code = message.text.strip().upper()
 
@@ -1447,28 +1732,9 @@ async def process_search(message: Message):
 
         return True
 
-    await send_found_file(
-        message,
-        row
-    )
-
-    return True
-
-
-async def send_found_file(
-    message: Message,
-    row
-):
-
-    file_type = normalize_file_type(
-        row["file_type"],
-        row["file_name"]
-    )
-
-    icon = get_icon(file_type)
-
-    text = (
-        f"{icon} <b>Файл найден</b>\n\n"
+    await message.answer(
+        f"{get_icon(row['file_type'])} "
+        "<b>Файл найден</b>\n\n"
         f"📄 <b>Имя:</b> "
         f"{escape_html(row['file_name'])}\n"
         f"📦 <b>Размер:</b> "
@@ -1476,51 +1742,53 @@ async def send_found_file(
         f"🔑 <b>Код:</b> "
         f"<code>{row['code']}</code>\n"
         f"📥 <b>Скачиваний:</b> "
-        f"{row['downloads']}"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📥 Получить",
-                    callback_data=f"get:{row['code']}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑️ Удалить",
-                    callback_data=f"delete:{row['code']}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏠 Главное меню",
-                    callback_data="home"
-                )
+        f"{row['downloads']}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📥 Получить",
+                        callback_data=(
+                            f"get:{row['code']}"
+                        )
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🗑️ Удалить",
+                        callback_data=(
+                            f"delete:{row['code']}"
+                        )
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home"
+                    )
+                ]
             ]
-        ]
+        )
     )
 
-    await message.answer(
-        text,
-        reply_markup=keyboard
-    )
+    return True
 
 
 # ============================================================
 # TEXT
 # ============================================================
 
-async def handle_text(message: Message):
+async def handle_text(
+    message: Message
+):
 
     user_id = message.from_user.id
 
     if user_id in searching_users:
 
-        handled = await process_search(message)
-
-        if handled:
+        if await process_search(
+            message
+        ):
             return
 
     if user_id in waiting_for_file:
@@ -1543,7 +1811,9 @@ async def handle_text(message: Message):
 # STATISTICS
 # ============================================================
 
-async def statistics(callback: CallbackQuery):
+async def statistics(
+    callback: CallbackQuery
+):
 
     user_id = callback.from_user.id
 
@@ -1560,7 +1830,10 @@ async def statistics(callback: CallbackQuery):
 
         downloads = await conn.fetchval(
             """
-            SELECT COALESCE(SUM(downloads), 0)
+            SELECT COALESCE(
+                SUM(downloads),
+                0
+            )
             FROM files
             WHERE user_id = $1
             """,
@@ -1569,24 +1842,24 @@ async def statistics(callback: CallbackQuery):
 
         total_size = await conn.fetchval(
             """
-            SELECT COALESCE(SUM(file_size), 0)
+            SELECT COALESCE(
+                SUM(file_size),
+                0
+            )
             FROM files
             WHERE user_id = $1
             """,
             user_id
         )
 
-    text = (
+    await callback.message.edit_text(
         "📊 <b>Статистика</b>\n\n"
-        f"📁 Всего файлов: <b>{total}</b>\n"
+        f"📁 Всего файлов: "
+        f"<b>{total}</b>\n"
         f"📦 Общий размер: "
         f"<b>{format_size(total_size)}</b>\n"
-        f"📥 Скачиваний: <b>{downloads}</b>\n\n"
-        "Разделы находятся в «📂 Мои файлы»."
-    )
-
-    await callback.message.edit_text(
-        text,
+        f"📥 Скачиваний: "
+        f"<b>{downloads}</b>",
         reply_markup=home_keyboard()
     )
 
@@ -1597,24 +1870,22 @@ async def statistics(callback: CallbackQuery):
 # HELP
 # ============================================================
 
-async def help_page(callback: CallbackQuery):
+async def help_page(
+    callback: CallbackQuery
+):
 
-    text = (
+    await callback.message.edit_text(
         "ℹ️ <b>Помощь</b>\n\n"
         "📤 <b>Загрузить файл</b>\n"
         "Сохраняет файл и выдаёт уникальный код.\n\n"
         "📂 <b>Мои файлы</b>\n"
         "Файлы разделены по категориям.\n\n"
-        "🖼️ Фото, видео и GIF отображаются "
-        "не только по названию, а прямо в Telegram.\n\n"
+        "🖼️ Изображения, 🎥 видео и 🎞️ GIF "
+        "показываются прямо в Telegram.\n\n"
         "🔢 В каждой категории максимум "
         "<b>10 файлов на страницу</b>.\n\n"
         "🔎 <b>Найти файл</b>\n"
-        "Позволяет получить файл по его коду."
-    )
-
-    await callback.message.edit_text(
-        text,
+        "Позволяет получить файл по коду.",
         reply_markup=home_keyboard()
     )
 
@@ -1625,19 +1896,17 @@ async def help_page(callback: CallbackQuery):
 # SETTINGS
 # ============================================================
 
-async def settings(callback: CallbackQuery):
+async def settings(
+    callback: CallbackQuery
+):
 
-    text = (
+    await callback.message.edit_text(
         "⚙️ <b>Настройки</b>\n\n"
         "📁 Хранилище: PostgreSQL\n"
         "☁️ Файлы: Telegram File ID\n"
         "🔑 Коды: автоматически\n"
         "📄 Страница: до 10 файлов\n"
-        "🛡️ Удаление: только владелец"
-    )
-
-    await callback.message.edit_text(
-        text,
+        "🛡️ Удаление: только владелец",
         reply_markup=home_keyboard()
     )
 
@@ -1648,29 +1917,17 @@ async def settings(callback: CallbackQuery):
 # COMMANDS
 # ============================================================
 
-async def cmd_myfiles(message: Message):
-
-    user_id = message.from_user.id
-
-    async with db_pool.acquire() as conn:
-
-        total = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM files
-            WHERE user_id = $1
-            """,
-            user_id
-        )
+async def cmd_myfiles(
+    message: Message
+):
 
     await message.answer(
-        f"📂 У тебя сохранено файлов: <b>{total}</b>\n\n"
-        "Открой категории:",
+        "📂 <b>Мои файлы</b>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="📂 Открыть мои файлы",
+                        text="📂 Открыть",
                         callback_data="myfiles"
                     )
                 ]
@@ -1679,9 +1936,13 @@ async def cmd_myfiles(message: Message):
     )
 
 
-async def cmd_get(message: Message):
+async def cmd_get(
+    message: Message
+):
 
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
 
@@ -1774,9 +2035,13 @@ async def send_file_by_row(
         )
 
 
-async def cmd_info(message: Message):
+async def cmd_info(
+    message: Message
+):
 
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
 
@@ -1823,9 +2088,13 @@ async def cmd_info(message: Message):
     )
 
 
-async def cmd_delete(message: Message):
+async def cmd_delete(
+    message: Message
+):
 
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
 
@@ -1880,10 +2149,12 @@ async def cmd_delete(message: Message):
 
 
 # ============================================================
-# HTTP SERVER — RENDER
+# HTTP SERVER FOR RENDER
 # ============================================================
 
-async def index(request):
+async def index(
+    request
+):
 
     return web.json_response({
         "status": "online",
@@ -1891,7 +2162,9 @@ async def index(request):
     })
 
 
-async def health(request):
+async def health(
+    request
+):
 
     return web.json_response({
         "status": "ok",
@@ -1914,7 +2187,9 @@ async def start_http_server():
         health
     )
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(
+        app
+    )
 
     await runner.setup()
 
@@ -1933,38 +2208,55 @@ async def start_http_server():
 
 
 # ============================================================
-# CALLBACKS
+# CALLBACK HANDLER
 # ============================================================
 
-async def callback_handler(callback: CallbackQuery):
+async def callback_handler(
+    callback: CallbackQuery
+):
 
     data = callback.data or ""
 
     # Главное меню
     if data == "home":
 
-        await show_home(callback)
+        await show_home(
+            callback
+        )
+
         return
 
     # Загрузка
     if data == "upload":
 
-        await upload_start(callback)
+        await upload_start(
+            callback
+        )
+
         return
 
     # Мои файлы
     if data == "myfiles":
 
-        await my_files(callback)
+        await my_files(
+            callback
+        )
+
         return
 
-    # Категория
-    if data.startswith("category:"):
+    # Категория + страница
+    if data.startswith(
+        "category:"
+    ):
 
-        parts = data.split(":")
+        parts = data.split(
+            ":"
+        )
 
         file_type = parts[1]
-        page = int(parts[2])
+        page = int(
+            parts[2]
+        )
 
         await show_category_page(
             callback,
@@ -1974,85 +2266,91 @@ async def callback_handler(callback: CallbackQuery):
 
         return
 
-    # Неактивная кнопка страницы
+    # Пустая кнопка страницы
     if data == "noop":
 
-        await noop(callback)
+        await noop(
+            callback
+        )
+
         return
 
     # Поиск
     if data == "search":
 
-        await search_start(callback)
+        await search_start(
+            callback
+        )
+
         return
 
     # Статистика
     if data == "stats":
 
-        await statistics(callback)
+        await statistics(
+            callback
+        )
+
         return
 
     # Помощь
     if data == "help":
 
-        await help_page(callback)
+        await help_page(
+            callback
+        )
+
         return
 
     # Настройки
     if data == "settings":
 
-        await settings(callback)
+        await settings(
+            callback
+        )
+
         return
 
-    # Получение
-    if data.startswith("get:"):
+    # Получить
+    if data.startswith(
+        "get:"
+    ):
 
-        await get_file(callback)
+        await get_file(
+            callback
+        )
+
         return
 
     # Информация
-    if data.startswith("info:"):
+    if data.startswith(
+        "info:"
+    ):
 
-        await info_file(callback)
+        await info_file(
+            callback
+        )
+
         return
 
     # Удаление
-    if data.startswith("delete:"):
+    if data.startswith(
+        "delete:"
+    ):
 
-        await delete_start(callback)
+        await delete_start(
+            callback
+        )
+
         return
 
     # Подтверждение удаления
-    if data.startswith("confirm_delete:"):
+    if data.startswith(
+        "confirm_delete:"
+    ):
 
-        await confirm_delete(callback)
-        return
-
-    # Вернуться в категорию
-    if data.startswith("backfile:"):
-
-        file_type = data.split(":", 1)[1]
-
-        await callback.answer()
-
-        await clear_page_messages(
-            callback.bot,
-            callback.from_user.id
-        )
-
-        # Показываем первую страницу через временный callback
-        # напрямую
-        class TempCallback:
-            pass
-
-        temp = TempCallback()
-        temp.bot = callback.bot
-        temp.from_user = callback.from_user
-
-        await show_category_page(
-            callback,
-            file_type,
-            1
+        await confirm_delete(
+            callback
         )
 
         return
@@ -2174,7 +2472,9 @@ if __name__ == "__main__":
 
     try:
 
-        asyncio.run(main())
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
 
