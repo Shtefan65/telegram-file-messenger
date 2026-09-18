@@ -1,36 +1,13 @@
 services:
-
-  - type: pserv
-    name: telegram-local-api
-    runtime: image
-
-    image:
-      url: docker.io/aiogram/telegram-bot-api:latest
-
-    envVars:
-      - key: TELEGRAM_API_ID
-        sync: false
-
-      - key: TELEGRAM_API_HASH
-        sync: false
-
-    disk:
-      name: telegram-api-data
-      mountPath: /var/lib/telegram-bot-api
-      sizeGB: 20
-
-
-  - type: worker
+  - type: web
     name: telegram-file-messenger
-
     runtime: python
+    plan: free
 
     buildCommand: pip install -r requirements.txt
-
     startCommand: python bot.py
 
     envVars:
-
       - key: BOT_TOKEN
         sync: false
 
@@ -39,14 +16,9 @@ services:
           name: file-messenger-db
           property: connectionString
 
-      - key: BOT_API_BASE_URL
-        value: http://telegram-local-api:8081
-
+      - key: PYTHON_VERSION
+        value: 3.12
 
 databases:
-
   - name: file-messenger-db
-
-    databaseName: file_messenger
-
-    user: file_messenger
+    plan: free
