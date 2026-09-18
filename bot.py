@@ -1,48 +1,38 @@
 import asyncio
-import html
 import logging
 import os
-import secrets
+import random
 import string
 from datetime import datetime
 
 import asyncpg
 from aiohttp import web
-
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
-    CallbackQuery,
-    Document,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
+from aiogram.client.default import DefaultBotProperties
 
 
 # ============================================================
-# CONFIG
+# НАСТРОЙКИ
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-BOT_API_BASE_URL = os.getenv("BOT_API_BASE_URL")
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# Telegram Bot API поддерживает большие файлы в зависимости
-# от используемого API. Ограничение нашего менеджера:
-MAX_FILE_SIZE = 2_000_000_000
-
-FILES_PER_PAGE = 5
-
-
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+    raise RuntimeError("BOT_TOKEN не найден")
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+    raise RuntimeError("DATABASE_URL не найден")
 
 
 # ============================================================
@@ -51,18 +41,28 @@ if not DATABASE_URL:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# DATABASE
+# GLOBAL
 # ============================================================
 
-db_pool: asyncpg.Pool | None = None
+db_pool = None
 
+# Пользователи, которые сейчас ожидают файл
+waiting_for_file = set()
+
+# Временное состояние поиска
+searching_users = set()
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 async def init_db():
     global db_pool
@@ -70,13 +70,12 @@ async def init_db():
     db_pool = await asyncpg.create_pool(
         DATABASE_URL,
         min_size=1,
-        max_size=5,
+        max_size=5
     )
 
     async with db_pool.acquire() as conn:
 
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id BIGSERIAL PRIMARY KEY,
                 code VARCHAR(20) UNIQUE NOT NULL,
@@ -86,25 +85,28 @@ async def init_db():
                 file_name TEXT,
                 file_size BIGINT,
                 mime_type TEXT,
-                downloads INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-            """
-        )
+                file_type TEXT,
+                downloads INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-        await conn.execute(
-            """
+        # Если база была создана старой версией бота
+        # добавляем новые колонки
+        await conn.execute("""
+            ALTER TABLE files
+            ADD COLUMN IF NOT EXISTS file_type TEXT
+        """)
+
+        await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_files_user_id
-            ON files(user_id);
-            """
-        )
+            ON files(user_id)
+        """)
 
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_files_code
-            ON files(code);
-            """
-        )
+            ON files(code)
+        """)
 
     logger.info("Database initialized")
 
@@ -113,36 +115,23 @@ async def init_db():
 # CODE GENERATOR
 # ============================================================
 
-ALPHABET = string.ascii_uppercase + string.digits
-
-
-def generate_code() -> str:
-    part1 = "".join(
-        secrets.choice(ALPHABET)
-        for _ in range(5)
-    )
-
-    part2 = "".join(
-        secrets.choice(ALPHABET)
-        for _ in range(5)
-    )
-
-    return f"{part1}-{part2}"
-
-
-async def create_unique_code() -> str:
+async def generate_code():
     while True:
 
-        code = generate_code()
+        letters = ''.join(
+            random.choices(string.ascii_uppercase, k=5)
+        )
+
+        numbers = ''.join(
+            random.choices(string.digits, k=5)
+        )
+
+        code = f"{letters}-{numbers}"
 
         async with db_pool.acquire() as conn:
             exists = await conn.fetchval(
-                """
-                SELECT 1
-                FROM files
-                WHERE code = $1
-                """,
-                code,
+                "SELECT 1 FROM files WHERE code = $1",
+                code
             )
 
         if not exists:
@@ -153,191 +142,219 @@ async def create_unique_code() -> str:
 # HELPERS
 # ============================================================
 
-def format_size(size: int | None) -> str:
-
-    if not size:
+def format_size(size):
+    if size is None:
         return "Неизвестно"
 
-    units = [
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB",
-    ]
+    size = float(size)
 
-    value = float(size)
+    units = ["B", "KB", "MB", "GB", "TB"]
 
     for unit in units:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
 
-        if value < 1024:
-            return f"{value:.2f} {unit}"
+        size /= 1024
 
-        value /= 1024
-
-    return f"{value:.2f} PB"
+    return f"{size:.1f} PB"
 
 
-def escape(value) -> str:
-    return html.escape(str(value)) if value is not None else ""
+def escape_html(text):
+    if not text:
+        return ""
+
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def get_file_icon(file_type):
+    icons = {
+        "photo": "🖼️",
+        "video": "🎥",
+        "audio": "🎵",
+        "voice": "🎤",
+        "document": "📄",
+        "animation": "🎞️",
+    }
+
+    return icons.get(file_type, "📁")
+
+
+def get_file_type(message: Message):
+    """
+    Определяет тип файла Telegram-сообщения.
+    Возвращает:
+        file_type
+        file_id
+        file_unique_id
+        file_name
+        file_size
+        mime_type
+    """
+
+    # PHOTO
+    if message.photo:
+        photo = message.photo[-1]
+
+        return (
+            "photo",
+            photo.file_id,
+            photo.file_unique_id,
+            "photo.jpg",
+            None,
+            "image/jpeg"
+        )
+
+    # VIDEO
+    if message.video:
+        video = message.video
+
+        return (
+            "video",
+            video.file_id,
+            video.file_unique_id,
+            video.file_name or "video.mp4",
+            video.file_size,
+            video.mime_type or "video/mp4"
+        )
+
+    # AUDIO
+    if message.audio:
+        audio = message.audio
+
+        return (
+            "audio",
+            audio.file_id,
+            audio.file_unique_id,
+            audio.file_name or "audio.mp3",
+            audio.file_size,
+            audio.mime_type or "audio/mpeg"
+        )
+
+    # VOICE
+    if message.voice:
+        voice = message.voice
+
+        return (
+            "voice",
+            voice.file_id,
+            voice.file_unique_id,
+            "voice.ogg",
+            voice.file_size,
+            "audio/ogg"
+        )
+
+    # ANIMATION / GIF
+    if message.animation:
+        animation = message.animation
+
+        return (
+            "animation",
+            animation.file_id,
+            animation.file_unique_id,
+            animation.file_name or "animation.gif",
+            animation.file_size,
+            animation.mime_type or "image/gif"
+        )
+
+    # DOCUMENT
+    if message.document:
+        document = message.document
+
+        return (
+            "document",
+            document.file_id,
+            document.file_unique_id,
+            document.file_name or "document",
+            document.file_size,
+            document.mime_type
+        )
+
+    return None
 
 
 # ============================================================
 # KEYBOARDS
 # ============================================================
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-
+def main_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-
             [
                 InlineKeyboardButton(
                     text="📤 Загрузить файл",
-                    callback_data="upload",
+                    callback_data="upload"
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text="📂 Мои файлы",
-                    callback_data="files:0",
+                    callback_data="myfiles"
                 ),
                 InlineKeyboardButton(
                     text="🔎 Найти файл",
-                    callback_data="search",
-                ),
+                    callback_data="search"
+                )
             ],
-
             [
                 InlineKeyboardButton(
                     text="📊 Статистика",
-                    callback_data="stats",
-                ),
+                    callback_data="stats"
+                )
+            ],
+            [
                 InlineKeyboardButton(
                     text="ℹ️ Помощь",
-                    callback_data="help",
+                    callback_data="help"
                 ),
-            ],
-
-            [
                 InlineKeyboardButton(
                     text="⚙️ Настройки",
-                    callback_data="settings",
+                    callback_data="settings"
+                )
+            ]
+        ]
+    )
+
+
+def back_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home"
+                )
+            ]
+        ]
+    )
+
+
+def file_actions(code):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📥 Получить файл",
+                    callback_data=f"get:{code}"
                 )
             ],
-        ]
-    )
-
-
-def back_home_keyboard() -> InlineKeyboardMarkup:
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="home",
+                    text="🗑️ Удалить",
+                    callback_data=f"delete:{code}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home"
                 )
             ]
         ]
-    )
-
-
-def cancel_upload_keyboard() -> InlineKeyboardMarkup:
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="❌ Отмена",
-                    callback_data="home",
-                )
-            ]
-        ]
-    )
-
-
-def file_keyboard(
-    code: str,
-    owner: bool = True,
-) -> InlineKeyboardMarkup:
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text="📥 Получить",
-                callback_data=f"get:{code}",
-            ),
-            InlineKeyboardButton(
-                text="ℹ️ Подробнее",
-                callback_data=f"info:{code}",
-            ),
-        ]
-    ]
-
-    if owner:
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text="🗑 Удалить",
-                    callback_data=f"delete:{code}",
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ К списку",
-                callback_data="files:0",
-            ),
-            InlineKeyboardButton(
-                text="🏠 Главная",
-                callback_data="home",
-            ),
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
-
-
-# ============================================================
-# MAIN MENU
-# ============================================================
-
-async def show_main_menu(message: Message):
-
-    text = (
-        "📁 <b>FILE MANAGER</b>\n\n"
-        "Добро пожаловать в файловый менеджер.\n\n"
-        "Здесь ты можешь безопасно хранить свои "
-        "файлы и получать их по уникальному коду.\n\n"
-        "Выбери нужное действие ниже 👇"
-    )
-
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(),
-    )
-
-
-async def edit_to_main_menu(callback: CallbackQuery):
-
-    text = (
-        "📁 <b>FILE MANAGER</b>\n\n"
-        "Главное меню\n\n"
-        "Выбери нужное действие 👇"
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -345,177 +362,212 @@ async def edit_to_main_menu(callback: CallbackQuery):
 # START
 # ============================================================
 
-dp = Dispatcher()
-
-
-@dp.message(Command("start"))
 async def cmd_start(message: Message):
 
-    await show_main_menu(message)
+    text = (
+        "📁 <b>Файловый Менеджер</b>\n\n"
+        "Добро пожаловать!\n\n"
+        "Я могу сохранять практически любые файлы "
+        "и выдавать каждому уникальный код.\n\n"
+        "🖼️ Фото\n"
+        "🎥 Видео\n"
+        "🎵 Аудио\n"
+        "🎤 Голосовые\n"
+        "🎞️ GIF\n"
+        "📄 Документы\n"
+        "📦 Архивы\n"
+        "и многое другое.\n\n"
+        "Выберите действие:"
+    )
+
+    await message.answer(
+        text,
+        reply_markup=main_menu()
+    )
 
 
 # ============================================================
-# UPLOAD SCREEN
+# HOME
 # ============================================================
 
-@dp.callback_query(F.data == "upload")
-async def callback_upload(callback: CallbackQuery):
-
-    await callback.answer()
+async def show_home(target):
 
     text = (
-        "📤 <b>ЗАГРУЗКА ФАЙЛА</b>\n\n"
-        "Отправь мне файл следующим сообщением.\n\n"
-        "После загрузки я:\n"
-        "• сохраню файл;\n"
-        "• создам уникальный код;\n"
-        "• покажу информацию о файле.\n\n"
-        f"📦 Максимальный размер: "
-        f"{format_size(MAX_FILE_SIZE)}"
+        "📁 <b>Файловый Менеджер</b>\n\n"
+        "Выберите действие:"
+    )
+
+    if isinstance(target, CallbackQuery):
+
+        await target.message.edit_text(
+            text,
+            reply_markup=main_menu()
+        )
+
+        await target.answer()
+
+    else:
+
+        await target.answer(
+            text,
+            reply_markup=main_menu()
+        )
+
+
+# ============================================================
+# UPLOAD
+# ============================================================
+
+async def upload_start(callback: CallbackQuery):
+
+    user_id = callback.from_user.id
+
+    waiting_for_file.add(user_id)
+
+    text = (
+        "📤 <b>Загрузка файла</b>\n\n"
+        "Отправь мне файл.\n\n"
+        "Поддерживаются:\n"
+        "🖼️ Фото\n"
+        "🎥 Видео\n"
+        "🎵 Аудио\n"
+        "🎤 Голосовые\n"
+        "🎞️ GIF\n"
+        "📄 Документы\n"
+        "📦 Архивы\n\n"
+        "После получения я сохраню его и выдам уникальный код."
     )
 
     await callback.message.edit_text(
         text,
-        parse_mode="HTML",
-        reply_markup=cancel_upload_keyboard(),
-    )
-
-
-# ============================================================
-# FILE UPLOAD
-# ============================================================
-
-@dp.message(F.document)
-async def handle_document(
-    message: Message,
-    bot: Bot,
-):
-
-    document: Document = message.document
-
-    if (
-        document.file_size
-        and document.file_size > MAX_FILE_SIZE
-    ):
-
-        await message.answer(
-            "❌ <b>Файл слишком большой</b>\n\n"
-            f"Максимальный размер: "
-            f"{format_size(MAX_FILE_SIZE)}",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
-        )
-
-        return
-
-    status_message = await message.answer(
-        "⏳ <b>Сохраняю файл...</b>",
-        parse_mode="HTML",
-    )
-
-    try:
-
-        code = await create_unique_code()
-
-        async with db_pool.acquire() as conn:
-
-            await conn.execute(
-                """
-                INSERT INTO files (
-                    code,
-                    user_id,
-                    file_id,
-                    file_unique_id,
-                    file_name,
-                    file_size,
-                    mime_type
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    $3,
-                    $4,
-                    $5,
-                    $6,
-                    $7
-                )
-                """,
-                code,
-                message.from_user.id,
-                document.file_id,
-                document.file_unique_id,
-                document.file_name,
-                document.file_size,
-                document.mime_type,
-            )
-
-        text = (
-            "✅ <b>ФАЙЛ СОХРАНЁН</b>\n\n"
-            f"📄 <b>Имя:</b> "
-            f"<code>{escape(document.file_name)}</code>\n"
-            f"📦 <b>Размер:</b> "
-            f"{format_size(document.file_size)}\n"
-            f"🔑 <b>Код:</b> "
-            f"<code>{code}</code>\n\n"
-            "Файл готов к использованию."
-        )
-
-        keyboard = InlineKeyboardMarkup(
+        reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-
                 [
                     InlineKeyboardButton(
-                        text="📥 Получить файл",
-                        callback_data=f"get:{code}",
+                        text="❌ Отмена",
+                        callback_data="home"
                     )
-                ],
-
-                [
-                    InlineKeyboardButton(
-                        text="ℹ️ Информация",
-                        callback_data=f"info:{code}",
-                    )
-                ],
-
-                [
-                    InlineKeyboardButton(
-                        text="📂 Мои файлы",
-                        callback_data="files:0",
-                    ),
-                    InlineKeyboardButton(
-                        text="🏠 Главная",
-                        callback_data="home",
-                    ),
-                ],
+                ]
             ]
         )
+    )
 
-        await status_message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
+    await callback.answer()
+
+
+# ============================================================
+# SAVE FILE
+# ============================================================
+
+async def save_file(message: Message):
+
+    user_id = message.from_user.id
+
+    file_data = get_file_type(message)
+
+    if not file_data:
+        return False
+
+    (
+        file_type,
+        file_id,
+        file_unique_id,
+        file_name,
+        file_size,
+        mime_type
+    ) = file_data
+
+    code = await generate_code()
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            INSERT INTO files (
+                code,
+                user_id,
+                file_id,
+                file_unique_id,
+                file_name,
+                file_size,
+                mime_type,
+                file_type
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            """,
+            code,
+            user_id,
+            file_id,
+            file_unique_id,
+            file_name,
+            file_size,
+            mime_type,
+            file_type
         )
 
-    except Exception:
+    waiting_for_file.discard(user_id)
 
-        logger.exception("File save error")
+    icon = get_file_icon(file_type)
 
-        await status_message.edit_text(
-            "❌ <b>Не удалось сохранить файл.</b>\n\n"
-            "Попробуй ещё раз.",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+    text = (
+        "✅ <b>Файл сохранён!</b>\n\n"
+        f"{icon} <b>Тип:</b> {escape_html(file_type)}\n"
+        f"📄 <b>Имя:</b> {escape_html(file_name)}\n"
+        f"📦 <b>Размер:</b> {format_size(file_size)}\n"
+        f"🔑 <b>Код:</b> <code>{code}</code>\n\n"
+        "Сохрани этот код — по нему можно получить файл."
+    )
+
+    await message.answer(
+        text,
+        reply_markup=file_actions(code)
+    )
+
+    logger.info(
+        "File saved: user=%s code=%s type=%s name=%s",
+        user_id,
+        code,
+        file_type,
+        file_name
+    )
+
+    return True
+
+
+# ============================================================
+# FILE MESSAGE HANDLER
+# ============================================================
+
+async def handle_file(message: Message):
+
+    user_id = message.from_user.id
+
+    # Если пользователь специально находится в режиме загрузки
+    # или прислал поддерживаемый файл — сохраняем его.
+    file_data = get_file_type(message)
+
+    if not file_data:
+        return
+
+    if user_id not in waiting_for_file:
+        # Если файл отправлен просто так,
+        # тоже предлагаем сохранить его.
+        await message.answer(
+            "📁 Я получил файл.\n\n"
+            "Чтобы сохранить его, нажми "
+            "«📤 Загрузить файл», затем отправь файл ещё раз.",
+            reply_markup=main_menu()
         )
+        return
+
+    await save_file(message)
 
 
 # ============================================================
 # MY FILES
 # ============================================================
 
-async def show_files(
-    callback: CallbackQuery,
-    page: int = 0,
-):
+async def my_files(callback: CallbackQuery):
 
     user_id = callback.from_user.id
 
@@ -527,268 +579,266 @@ async def show_files(
                 code,
                 file_name,
                 file_size,
+                file_type,
                 downloads,
                 created_at
             FROM files
             WHERE user_id = $1
             ORDER BY created_at DESC
+            LIMIT 30
             """,
-            user_id,
+            user_id
         )
 
-    total = len(rows)
-
-    if total == 0:
+    if not rows:
 
         await callback.message.edit_text(
-            "📂 <b>МОИ ФАЙЛЫ</b>\n\n"
-            "Здесь пока пусто.\n\n"
-            "Загрузи первый файл, чтобы он появился здесь.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="📤 Загрузить файл",
-                            callback_data="upload",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="🏠 Главная",
-                            callback_data="home",
-                        )
-                    ],
-                ]
-            ),
+            "📂 <b>Мои файлы</b>\n\n"
+            "У тебя пока нет сохранённых файлов.",
+            reply_markup=back_menu()
         )
 
+        await callback.answer()
         return
 
-    start = page * FILES_PER_PAGE
-    end = start + FILES_PER_PAGE
-
-    page_rows = rows[start:end]
-
-    total_pages = (
-        total + FILES_PER_PAGE - 1
-    ) // FILES_PER_PAGE
-
-    text = (
-        "📂 <b>МОИ ФАЙЛЫ</b>\n\n"
-        f"Всего файлов: <b>{total}</b>\n\n"
-    )
+    text = "📂 <b>Мои файлы</b>\n\n"
 
     buttons = []
 
-    for row in page_rows:
+    for row in rows:
+
+        icon = get_file_icon(row["file_type"])
 
         name = row["file_name"] or "Без имени"
 
+        if len(name) > 25:
+            name = name[:22] + "..."
+
         text += (
-            f"📄 <b>{escape(name)}</b>\n"
-            f"🔑 <code>{row['code']}</code>\n"
-            f"📦 {format_size(row['file_size'])}\n"
-            f"⬇️ Скачиваний: {row['downloads']}\n\n"
+            f"{icon} <b>{escape_html(name)}</b>\n"
+            f"🔑 <code>{row['code']}</code>  "
+            f"📦 {format_size(row['file_size'])}\n\n"
         )
 
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f"📄 {name[:30]}",
-                    callback_data=f"file:{row['code']}",
-                )
-            ]
-        )
-
-    navigation = []
-
-    if page > 0:
-
-        navigation.append(
+        buttons.append([
             InlineKeyboardButton(
-                text="⬅️",
-                callback_data=f"files:{page - 1}",
+                text=f"{icon} {name}",
+                callback_data=f"get:{row['code']}"
             )
-        )
+        ])
 
-    navigation.append(
+    buttons.append([
         InlineKeyboardButton(
-            text=f"{page + 1}/{total_pages}",
-            callback_data="noop",
+            text="🏠 Главное меню",
+            callback_data="home"
         )
-    )
-
-    if page + 1 < total_pages:
-
-        navigation.append(
-            InlineKeyboardButton(
-                text="➡️",
-                callback_data=f"files:{page + 1}",
-            )
-        )
-
-    if navigation:
-        buttons.append(navigation)
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🏠 Главная",
-                callback_data="home",
-            )
-        ]
-    )
+    ])
 
     await callback.message.edit_text(
         text,
-        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=buttons
-        ),
+        )
     )
-
-
-@dp.callback_query(F.data.startswith("files:"))
-async def callback_files(callback: CallbackQuery):
 
     await callback.answer()
 
-    page = int(
-        callback.data.split(":")[1]
-    )
-
-    await show_files(
-        callback,
-        page,
-    )
-
 
 # ============================================================
-# FILE DETAILS
+# SEARCH
 # ============================================================
 
-@dp.callback_query(F.data.startswith("file:"))
-async def callback_file(callback: CallbackQuery):
+async def search_start(callback: CallbackQuery):
+
+    searching_users.add(callback.from_user.id)
+
+    await callback.message.edit_text(
+        "🔎 <b>Поиск файла</b>\n\n"
+        "Отправь мне код файла.\n\n"
+        "Например:\n"
+        "<code>ABCDE-12345</code>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отмена",
+                        callback_data="home"
+                    )
+                ]
+            ]
+        )
+    )
 
     await callback.answer()
 
-    code = callback.data.split(":", 1)[1]
+
+async def process_search(message: Message):
+
+    user_id = message.from_user.id
+
+    if user_id not in searching_users:
+        return False
+
+    searching_users.discard(user_id)
+
+    code = message.text.strip().upper()
 
     async with db_pool.acquire() as conn:
 
         row = await conn.fetchrow(
             """
-            SELECT *
+            SELECT
+                code,
+                user_id,
+                file_id,
+                file_name,
+                file_size,
+                mime_type,
+                file_type,
+                downloads,
+                created_at
             FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
     if not row:
 
-        await callback.message.edit_text(
-            "❌ Файл не найден.",
-            reply_markup=back_home_keyboard(),
+        await message.answer(
+            "❌ <b>Файл не найден</b>\n\n"
+            "Проверь код и попробуй ещё раз.",
+            reply_markup=main_menu()
         )
 
-        return
+        return True
 
-    owner = (
-        row["user_id"]
-        == callback.from_user.id
+    await send_file_info(
+        message,
+        row
     )
 
-    text = (
-        "📄 <b>ФАЙЛ</b>\n\n"
-        f"📄 <b>Имя:</b> "
-        f"<code>{escape(row['file_name'] or 'Без имени')}</code>\n"
-        f"📦 <b>Размер:</b> "
-        f"{format_size(row['file_size'])}\n"
-        f"🔑 <b>Код:</b> "
-        f"<code>{row['code']}</code>\n"
-        f"⬇️ <b>Скачиваний:</b> "
-        f"{row['downloads']}\n"
-        f"📅 <b>Дата:</b> "
-        f"{row['created_at']}"
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=file_keyboard(
-            code,
-            owner,
-        ),
-    )
+    return True
 
 
 # ============================================================
 # GET FILE
 # ============================================================
 
-@dp.callback_query(F.data.startswith("get:"))
-async def callback_get_file(
-    callback: CallbackQuery,
-    bot: Bot,
-):
+async def get_file(callback: CallbackQuery):
 
     code = callback.data.split(":", 1)[1]
-
-    await callback.answer(
-        "⏳ Отправляю файл..."
-    )
 
     async with db_pool.acquire() as conn:
 
         row = await conn.fetchrow(
             """
-            SELECT *
+            SELECT
+                id,
+                code,
+                user_id,
+                file_id,
+                file_name,
+                file_size,
+                mime_type,
+                file_type,
+                downloads
             FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
     if not row:
 
-        await callback.message.answer(
-            "❌ Файл не найден."
+        await callback.answer(
+            "Файл не найден",
+            show_alert=True
         )
 
         return
 
+    # Увеличиваем счётчик скачиваний
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            UPDATE files
+            SET downloads = downloads + 1
+            WHERE code = $1
+            """,
+            code
+        )
+
+    file_type = row["file_type"]
+
     try:
 
-        await bot.send_document(
-            callback.message.chat.id,
-            row["file_id"],
-            caption=(
-                f"📄 {row['file_name'] or 'Файл'}\n"
-                f"🔑 Код: {row['code']}"
-            ),
-        )
+        if file_type == "photo":
 
-        async with db_pool.acquire() as conn:
-
-            await conn.execute(
-                """
-                UPDATE files
-                SET downloads = downloads + 1
-                WHERE code = $1
-                """,
-                code,
+            await callback.message.answer_photo(
+                row["file_id"],
+                caption=(
+                    f"🖼️ <b>{escape_html(row['file_name'])}</b>\n"
+                    f"🔑 Код: <code>{row['code']}</code>"
+                )
             )
 
-    except Exception:
+        elif file_type == "video":
 
-        logger.exception(
-            "Failed to send file"
-        )
+            await callback.message.answer_video(
+                row["file_id"],
+                caption=(
+                    f"🎥 <b>{escape_html(row['file_name'])}</b>\n"
+                    f"🔑 Код: <code>{row['code']}</code>"
+                )
+            )
 
-        await callback.message.answer(
-            "❌ Не удалось отправить файл."
+        elif file_type == "audio":
+
+            await callback.message.answer_audio(
+                row["file_id"],
+                caption=(
+                    f"🎵 <b>{escape_html(row['file_name'])}</b>\n"
+                    f"🔑 Код: <code>{row['code']}</code>"
+                )
+            )
+
+        elif file_type == "voice":
+
+            await callback.message.answer_voice(
+                row["file_id"]
+            )
+
+        elif file_type == "animation":
+
+            await callback.message.answer_animation(
+                row["file_id"],
+                caption=(
+                    f"🎞️ <b>{escape_html(row['file_name'])}</b>\n"
+                    f"🔑 Код: <code>{row['code']}</code>"
+                )
+            )
+
+        else:
+
+            await callback.message.answer_document(
+                row["file_id"],
+                caption=(
+                    f"📄 <b>{escape_html(row['file_name'])}</b>\n"
+                    f"🔑 Код: <code>{row['code']}</code>"
+                )
+            )
+
+        await callback.answer("✅ Файл отправлен")
+
+    except Exception as e:
+
+        logger.exception("Failed to send file")
+
+        await callback.answer(
+            "❌ Не удалось отправить файл",
+            show_alert=True
         )
 
 
@@ -796,10 +846,28 @@ async def callback_get_file(
 # FILE INFO
 # ============================================================
 
-@dp.callback_query(F.data.startswith("info:"))
-async def callback_info(callback: CallbackQuery):
+async def send_file_info(message: Message, row):
 
-    await callback.answer()
+    icon = get_file_icon(row["file_type"])
+
+    text = (
+        f"{icon} <b>Информация о файле</b>\n\n"
+        f"📄 <b>Имя:</b> "
+        f"{escape_html(row['file_name'] or 'Без имени')}\n"
+        f"📦 <b>Размер:</b> {format_size(row['file_size'])}\n"
+        f"🔧 <b>Тип:</b> {escape_html(row['file_type'])}\n"
+        f"🔑 <b>Код:</b> <code>{row['code']}</code>\n"
+        f"📥 <b>Скачиваний:</b> {row['downloads']}\n\n"
+        "Нажми кнопку ниже, чтобы получить файл."
+    )
+
+    await message.answer(
+        text,
+        reply_markup=file_actions(row["code"])
+    )
+
+
+async def info_file(callback: CallbackQuery):
 
     code = callback.data.split(":", 1)[1]
 
@@ -807,172 +875,143 @@ async def callback_info(callback: CallbackQuery):
 
         row = await conn.fetchrow(
             """
-            SELECT *
+            SELECT
+                code,
+                file_name,
+                file_size,
+                mime_type,
+                file_type,
+                downloads,
+                created_at
             FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
     if not row:
 
-        await callback.message.edit_text(
-            "❌ Файл не найден.",
-            reply_markup=back_home_keyboard(),
+        await callback.answer(
+            "Файл не найден",
+            show_alert=True
         )
 
         return
 
+    icon = get_file_icon(row["file_type"])
+
+    created = row["created_at"]
+
+    if isinstance(created, datetime):
+        created = created.strftime("%d.%m.%Y %H:%M")
+
     text = (
-        "ℹ️ <b>ИНФОРМАЦИЯ О ФАЙЛЕ</b>\n\n"
-        f"📄 <b>Имя:</b>\n"
-        f"<code>{escape(row['file_name'] or 'Без имени')}</code>\n\n"
-        f"🔑 <b>Код:</b>\n"
-        f"<code>{row['code']}</code>\n\n"
-        f"📦 <b>Размер:</b> "
-        f"{format_size(row['file_size'])}\n"
-        f"⬇️ <b>Скачиваний:</b> "
-        f"{row['downloads']}\n"
-        f"🗂 <b>MIME:</b> "
-        f"{escape(row['mime_type'] or 'Не указан')}\n"
-        f"📅 <b>Загружен:</b> "
-        f"{row['created_at']}"
+        f"{icon} <b>Информация о файле</b>\n\n"
+        f"📄 <b>Имя:</b> "
+        f"{escape_html(row['file_name'] or 'Без имени')}\n"
+        f"📦 <b>Размер:</b> {format_size(row['file_size'])}\n"
+        f"🔧 <b>Тип:</b> {escape_html(row['file_type'])}\n"
+        f"📝 <b>MIME:</b> "
+        f"{escape_html(row['mime_type'] or 'Неизвестно')}\n"
+        f"🔑 <b>Код:</b> <code>{row['code']}</code>\n"
+        f"📥 <b>Скачиваний:</b> {row['downloads']}\n"
+        f"📅 <b>Дата:</b> {created}"
     )
 
     await callback.message.edit_text(
         text,
-        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
                         text="📥 Получить",
-                        callback_data=f"get:{code}",
+                        callback_data=f"get:{code}"
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="🗑 Удалить",
-                        callback_data=f"delete:{code}",
+                        text="🗑️ Удалить",
+                        callback_data=f"delete:{code}"
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="⬅️ Назад",
-                        callback_data=f"file:{code}",
+                        text="🏠 Главное меню",
+                        callback_data="home"
                     )
-                ],
+                ]
             ]
-        ),
+        )
     )
-
-
-# ============================================================
-# DELETE CONFIRMATION
-# ============================================================
-
-@dp.callback_query(F.data.startswith("delete:"))
-async def callback_delete(callback: CallbackQuery):
 
     await callback.answer()
 
+
+# ============================================================
+# DELETE
+# ============================================================
+
+async def delete_start(callback: CallbackQuery):
+
     code = callback.data.split(":", 1)[1]
-
-    async with db_pool.acquire() as conn:
-
-        row = await conn.fetchrow(
-            """
-            SELECT *
-            FROM files
-            WHERE code = $1
-            """,
-            code,
-        )
-
-    if not row:
-
-        await callback.message.edit_text(
-            "❌ Файл уже удалён.",
-            reply_markup=back_home_keyboard(),
-        )
-
-        return
-
-    if row["user_id"] != callback.from_user.id:
-
-        await callback.message.edit_text(
-            "❌ У тебя нет доступа к удалению этого файла.",
-            reply_markup=back_home_keyboard(),
-        )
-
-        return
-
-    name = row["file_name"] or "Без имени"
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="🗑 Да, удалить",
-                    callback_data=f"confirm_delete:{code}",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="❌ Отмена",
-                    callback_data=f"file:{code}",
-                )
-            ],
-        ]
-    )
 
     await callback.message.edit_text(
         "⚠️ <b>Удаление файла</b>\n\n"
-        f"📄 <code>{escape(name)}</code>\n\n"
-        "Ты действительно хочешь удалить этот файл?",
-        parse_mode="HTML",
-        reply_markup=keyboard,
+        f"Ты действительно хочешь удалить файл "
+        f"<code>{code}</code>?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Да, удалить",
+                        callback_data=f"confirm_delete:{code}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отмена",
+                        callback_data=f"get:{code}"
+                    )
+                ]
+            ]
+        )
     )
-
-
-@dp.callback_query(
-    F.data.startswith("confirm_delete:")
-)
-async def callback_confirm_delete(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
+
+async def confirm_delete(callback: CallbackQuery):
+
     code = callback.data.split(":", 1)[1]
+
+    user_id = callback.from_user.id
 
     async with db_pool.acquire() as conn:
 
         row = await conn.fetchrow(
             """
-            SELECT *
+            SELECT user_id, file_name
             FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
         if not row:
 
-            await callback.message.edit_text(
-                "❌ Файл уже удалён.",
-                reply_markup=back_home_keyboard(),
+            await callback.answer(
+                "Файл уже удалён",
+                show_alert=True
             )
 
             return
 
-        if row["user_id"] != callback.from_user.id:
+        # Только владелец может удалить файл
+        if row["user_id"] != user_id:
 
-            await callback.message.edit_text(
-                "❌ У тебя нет доступа.",
-                reply_markup=back_home_keyboard(),
+            await callback.answer(
+                "❌ Это не твой файл",
+                show_alert=True
             )
 
             return
@@ -982,66 +1021,197 @@ async def callback_confirm_delete(
             DELETE FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
     await callback.message.edit_text(
-        "🗑 <b>ФАЙЛ УДАЛЁН</b>\n\n"
-        "Файл успешно удалён из твоего хранилища.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📂 Мои файлы",
-                        callback_data="files:0",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🏠 Главная",
-                        callback_data="home",
-                    )
-                ],
-            ]
-        ),
+        "🗑️ <b>Файл удалён</b>\n\n"
+        f"Файл <code>{code}</code> больше недоступен.",
+        reply_markup=main_menu()
     )
 
+    await callback.answer("Удалено")
+
 
 # ============================================================
-# SEARCH
+# STATISTICS
 # ============================================================
 
-@dp.callback_query(F.data == "search")
-async def callback_search(callback: CallbackQuery):
+async def statistics(callback: CallbackQuery):
+
+    user_id = callback.from_user.id
+
+    async with db_pool.acquire() as conn:
+
+        total = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM files
+            WHERE user_id = $1
+            """,
+            user_id
+        )
+
+        downloads = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(downloads), 0)
+            FROM files
+            WHERE user_id = $1
+            """,
+            user_id
+        )
+
+        total_size = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(file_size), 0)
+            FROM files
+            WHERE user_id = $1
+            """,
+            user_id
+        )
+
+        photos = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM files
+            WHERE user_id = $1
+            AND file_type = 'photo'
+            """,
+            user_id
+        )
+
+        videos = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM files
+            WHERE user_id = $1
+            AND file_type = 'video'
+            """,
+            user_id
+        )
+
+        documents = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM files
+            WHERE user_id = $1
+            AND file_type = 'document'
+            """,
+            user_id
+        )
+
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"📁 Всего файлов: <b>{total}</b>\n"
+        f"🖼️ Фото: <b>{photos}</b>\n"
+        f"🎥 Видео: <b>{videos}</b>\n"
+        f"📄 Документы: <b>{documents}</b>\n"
+        f"📦 Общий размер: <b>{format_size(total_size)}</b>\n"
+        f"📥 Скачиваний: <b>{downloads}</b>"
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_menu()
+    )
 
     await callback.answer()
 
+
+# ============================================================
+# HELP
+# ============================================================
+
+async def help_page(callback: CallbackQuery):
+
+    text = (
+        "ℹ️ <b>Помощь</b>\n\n"
+        "📤 <b>Загрузить файл</b>\n"
+        "Отправляет файл в хранилище и выдаёт уникальный код.\n\n"
+        "🔎 <b>Найти файл</b>\n"
+        "Введи код, чтобы найти сохранённый файл.\n\n"
+        "📂 <b>Мои файлы</b>\n"
+        "Показывает твои сохранённые файлы.\n\n"
+        "📊 <b>Статистика</b>\n"
+        "Показывает количество файлов, их размер и скачивания.\n\n"
+        "Поддерживаются фото, видео, аудио, голосовые, GIF, "
+        "документы и архивы."
+    )
+
     await callback.message.edit_text(
-        "🔎 <b>ПОИСК ФАЙЛА</b>\n\n"
-        "Для поиска отправь название файла "
-        "или его код следующим сообщением.\n\n"
-        "Например:\n"
-        "<code>photo</code>\n"
-        "<code>A7K2M</code>",
-        parse_mode="HTML",
-        reply_markup=back_home_keyboard(),
+        text,
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+async def settings(callback: CallbackQuery):
+
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        "В этой версии основные параметры работают "
+        "автоматически.\n\n"
+        "📁 Хранилище: PostgreSQL\n"
+        "☁️ Файлы: Telegram File ID\n"
+        "🔑 Коды: автоматически генерируются\n"
+        "🛡️ Доступ к удалению: только владелец"
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# TEXT HANDLER
+# ============================================================
+
+async def handle_text(message: Message):
+
+    user_id = message.from_user.id
+
+    # Поиск
+    if user_id in searching_users:
+
+        handled = await process_search(message)
+
+        if handled:
+            return
+
+    # Если ждём файл
+    if user_id in waiting_for_file:
+
+        await message.answer(
+            "⚠️ Пожалуйста, отправь именно файл.\n\n"
+            "Можно отправить фото, видео, документ, "
+            "аудио, голосовое или GIF."
+        )
+
+        return
+
+    await message.answer(
+        "Выбери действие в меню:",
+        reply_markup=main_menu()
     )
 
 
-@dp.message(
-    F.text,
-    ~F.text.startswith("/")
-)
-async def handle_text_search(message: Message):
+# ============================================================
+# COMMANDS
+# ============================================================
 
-    query = message.text.strip()
+async def cmd_myfiles(message: Message):
 
-    if not query:
-        return
+    fake_callback = None
 
-    if len(query) > 100:
-        return
+    user_id = message.from_user.id
 
     async with db_pool.acquire() as conn:
 
@@ -1051,369 +1221,210 @@ async def handle_text_search(message: Message):
                 code,
                 file_name,
                 file_size,
-                downloads
+                file_type
             FROM files
             WHERE user_id = $1
-              AND (
-                    file_name ILIKE $2
-                    OR code ILIKE $2
-                  )
             ORDER BY created_at DESC
-            LIMIT 20
+            LIMIT 30
             """,
-            message.from_user.id,
-            f"%{query}%",
+            user_id
         )
 
     if not rows:
 
         await message.answer(
-            "🔎 <b>Ничего не найдено</b>\n\n"
-            f"По запросу <code>{escape(query)}</code> "
-            "файлов нет.",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+            "📂 У тебя пока нет файлов.",
+            reply_markup=main_menu()
         )
 
         return
 
-    text = (
-        "🔎 <b>РЕЗУЛЬТАТЫ ПОИСКА</b>\n\n"
-        f"Запрос: <code>{escape(query)}</code>\n\n"
-    )
-
-    buttons = []
+    text = "📂 <b>Мои файлы</b>\n\n"
 
     for row in rows:
 
-        name = row["file_name"] or "Без имени"
+        icon = get_file_icon(row["file_type"])
 
         text += (
-            f"📄 <b>{escape(name)}</b>\n"
+            f"{icon} "
+            f"<b>{escape_html(row['file_name'] or 'Без имени')}</b>\n"
             f"🔑 <code>{row['code']}</code>\n"
             f"📦 {format_size(row['file_size'])}\n\n"
         )
 
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f"📄 {name[:30]}",
-                    callback_data=f"file:{row['code']}",
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="🏠 Главная",
-                callback_data="home",
-            )
-        ]
-    )
-
     await message.answer(
         text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
+        reply_markup=main_menu()
     )
 
 
-# ============================================================
-# STATISTICS
-# ============================================================
+async def cmd_get(message: Message):
 
-@dp.callback_query(F.data == "stats")
-async def callback_stats(callback: CallbackQuery):
+    parts = message.text.split(maxsplit=1)
 
-    await callback.answer()
+    if len(parts) < 2:
+
+        await message.answer(
+            "Использование:\n"
+            "<code>/get ABCDE-12345</code>"
+        )
+
+        return
+
+    code = parts[1].strip().upper()
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM files
+            WHERE code = $1
+            """,
+            code
+        )
+
+    if not row:
+
+        await message.answer("❌ Файл не найден.")
+        return
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            UPDATE files
+            SET downloads = downloads + 1
+            WHERE code = $1
+            """,
+            code
+        )
+
+    file_type = row["file_type"]
+
+    if file_type == "photo":
+
+        await message.answer_photo(
+            row["file_id"]
+        )
+
+    elif file_type == "video":
+
+        await message.answer_video(
+            row["file_id"]
+        )
+
+    elif file_type == "audio":
+
+        await message.answer_audio(
+            row["file_id"]
+        )
+
+    elif file_type == "voice":
+
+        await message.answer_voice(
+            row["file_id"]
+        )
+
+    elif file_type == "animation":
+
+        await message.answer_animation(
+            row["file_id"]
+        )
+
+    else:
+
+        await message.answer_document(
+            row["file_id"]
+        )
+
+
+async def cmd_info(message: Message):
+
+    parts = message.text.split(maxsplit=1)
+
+    if len(parts) < 2:
+
+        await message.answer(
+            "Использование:\n"
+            "<code>/info ABCDE-12345</code>"
+        )
+
+        return
+
+    code = parts[1].strip().upper()
 
     async with db_pool.acquire() as conn:
 
         row = await conn.fetchrow(
             """
             SELECT
-                COUNT(*) AS files_count,
-                COALESCE(SUM(file_size), 0) AS total_size,
-                COALESCE(SUM(downloads), 0) AS downloads
-            FROM files
-            WHERE user_id = $1
-            """,
-            callback.from_user.id,
-        )
-
-    text = (
-        "📊 <b>СТАТИСТИКА</b>\n\n"
-        f"📁 Файлов: <b>{row['files_count']}</b>\n"
-        f"💾 Использовано: "
-        f"<b>{format_size(row['total_size'])}</b>\n"
-        f"⬇️ Скачиваний: "
-        f"<b>{row['downloads']}</b>\n\n"
-        "Статистика относится только к твоим файлам."
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=back_home_keyboard(),
-    )
-
-
-# ============================================================
-# HELP
-# ============================================================
-
-@dp.callback_query(F.data == "help")
-async def callback_help(callback: CallbackQuery):
-
-    await callback.answer()
-
-    text = (
-        "ℹ️ <b>ПОМОЩЬ</b>\n\n"
-        "📤 <b>Загрузить файл</b>\n"
-        "Отправь документ боту — он сохранит его "
-        "и выдаст уникальный код.\n\n"
-        "📂 <b>Мои файлы</b>\n"
-        "Просмотр всех загруженных тобой файлов.\n\n"
-        "🔎 <b>Поиск</b>\n"
-        "Поиск по имени или коду файла.\n\n"
-        "📥 <b>Получить</b>\n"
-        "Бот повторно отправит сохранённый файл.\n\n"
-        "🗑 <b>Удалить</b>\n"
-        "Удаление файла с подтверждением.\n\n"
-        "📊 <b>Статистика</b>\n"
-        "Размер хранилища, количество файлов "
-        "и скачиваний."
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=back_home_keyboard(),
-    )
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-@dp.callback_query(F.data == "settings")
-async def callback_settings(callback: CallbackQuery):
-
-    await callback.answer()
-
-    text = (
-        "⚙️ <b>НАСТРОЙКИ</b>\n\n"
-        "Сейчас доступны основные настройки "
-        "файлового менеджера.\n\n"
-        "🔐 Доступ к файлам определяется "
-        "владельцем файла.\n\n"
-        "📦 Максимальный размер файла: "
-        f"<b>{format_size(MAX_FILE_SIZE)}</b>\n\n"
-        "Дополнительные настройки можем добавить "
-        "в следующей версии."
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=back_home_keyboard(),
-    )
-
-
-# ============================================================
-# HOME
-# ============================================================
-
-@dp.callback_query(F.data == "home")
-async def callback_home(callback: CallbackQuery):
-
-    await callback.answer()
-
-    await edit_to_main_menu(callback)
-
-
-# ============================================================
-# NOOP
-# ============================================================
-
-@dp.callback_query(F.data == "noop")
-async def callback_noop(callback: CallbackQuery):
-
-    await callback.answer()
-
-
-# ============================================================
-# OLD COMMANDS — RESERVE
-# ============================================================
-
-@dp.message(Command("myfiles"))
-async def old_myfiles(message: Message):
-
-    fake_callback = None
-
-    await message.answer(
-        "📂 Открой раздел «Мои файлы» через меню:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📂 Мои файлы",
-                        callback_data="files:0",
-                    )
-                ]
-            ]
-        ),
-    )
-
-
-@dp.message(Command("get"))
-async def old_get(message: Message):
-
-    args = message.text.split(maxsplit=1)
-
-    if len(args) < 2:
-
-        await message.answer(
-            "Используй меню → 📂 Мои файлы."
-        )
-
-        return
-
-    code = args[1].strip().upper()
-
-    async with db_pool.acquire() as conn:
-
-        row = await conn.fetchrow(
-            """
-            SELECT *
-            FROM files
-            WHERE code = $1
-            """,
-            code,
-        )
-
-    if not row:
-
-        await message.answer(
-            "❌ Файл не найден."
-        )
-
-        return
-
-    try:
-
-        await message.bot.send_document(
-            message.chat.id,
-            row["file_id"],
-        )
-
-        async with db_pool.acquire() as conn:
-
-            await conn.execute(
-                """
-                UPDATE files
-                SET downloads = downloads + 1
-                WHERE code = $1
-                """,
                 code,
-            )
-
-    except Exception:
-
-        logger.exception(
-            "Old get command failed"
-        )
-
-        await message.answer(
-            "❌ Не удалось отправить файл."
-        )
-
-
-@dp.message(Command("info"))
-async def old_info(message: Message):
-
-    args = message.text.split(maxsplit=1)
-
-    if len(args) < 2:
-
-        await message.answer(
-            "Используй меню → 📂 Мои файлы."
-        )
-
-        return
-
-    code = args[1].strip().upper()
-
-    async with db_pool.acquire() as conn:
-
-        row = await conn.fetchrow(
-            """
-            SELECT *
+                file_name,
+                file_size,
+                mime_type,
+                file_type,
+                downloads,
+                created_at
             FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
     if not row:
 
-        await message.answer(
-            "❌ Файл не найден."
-        )
-
+        await message.answer("❌ Файл не найден.")
         return
 
+    icon = get_file_icon(row["file_type"])
+
     await message.answer(
-        "ℹ️ <b>Информация</b>\n\n"
-        f"📄 {escape(row['file_name'] or 'Без имени')}\n"
-        f"🔑 <code>{row['code']}</code>\n"
+        f"{icon} <b>Файл</b>\n\n"
+        f"📄 {escape_html(row['file_name'])}\n"
         f"📦 {format_size(row['file_size'])}\n"
-        f"⬇️ {row['downloads']} скачиваний",
-        parse_mode="HTML",
+        f"🔧 {escape_html(row['file_type'])}\n"
+        f"🔑 <code>{row['code']}</code>\n"
+        f"📥 Скачиваний: {row['downloads']}",
+        reply_markup=file_actions(row["code"])
     )
 
 
-@dp.message(Command("delete"))
-async def old_delete(message: Message):
+async def cmd_delete(message: Message):
 
-    args = message.text.split(maxsplit=1)
+    parts = message.text.split(maxsplit=1)
 
-    if len(args) < 2:
+    if len(parts) < 2:
 
         await message.answer(
-            "Используй меню → 📂 Мои файлы."
+            "Использование:\n"
+            "<code>/delete ABCDE-12345</code>"
         )
 
         return
 
-    code = args[1].strip().upper()
+    code = parts[1].strip().upper()
 
     async with db_pool.acquire() as conn:
 
         row = await conn.fetchrow(
             """
-            SELECT *
+            SELECT user_id
             FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
         if not row:
 
-            await message.answer(
-                "❌ Файл не найден."
-            )
-
+            await message.answer("❌ Файл не найден.")
             return
 
         if row["user_id"] != message.from_user.id:
 
             await message.answer(
-                "❌ Ты не можешь удалить этот файл."
+                "❌ Ты не можешь удалить чужой файл."
             )
 
             return
@@ -1423,53 +1434,42 @@ async def old_delete(message: Message):
             DELETE FROM files
             WHERE code = $1
             """,
-            code,
+            code
         )
 
     await message.answer(
-        "🗑 Файл удалён.",
-        reply_markup=main_menu_keyboard(),
+        "🗑️ Файл удалён.",
+        reply_markup=main_menu()
     )
 
 
 # ============================================================
-# HEALTH SERVER
+# HTTP SERVER FOR RENDER
 # ============================================================
 
 async def health(request):
 
-    return web.json_response(
-        {
-            "status": "ok",
-            "service": "telegram-file-manager",
-            "time": datetime.utcnow().isoformat(),
-        }
-    )
+    return web.json_response({
+        "status": "ok",
+        "service": "telegram-file-manager",
+        "time": datetime.utcnow().isoformat()
+    })
 
 
-async def root(request):
+async def index(request):
 
-    return web.json_response(
-        {
-            "status": "running",
-            "service": "Telegram File Manager",
-        }
-    )
+    return web.json_response({
+        "status": "online",
+        "service": "Telegram File Manager"
+    })
 
 
-async def start_web_server():
+async def start_http_server():
 
     app = web.Application()
 
-    app.router.add_get(
-        "/",
-        root,
-    )
-
-    app.router.add_get(
-        "/health",
-        health,
-    )
+    app.router.add_get("/", index)
+    app.router.add_get("/health", health)
 
     runner = web.AppRunner(app)
 
@@ -1477,18 +1477,91 @@ async def start_web_server():
 
     site = web.TCPSite(
         runner,
-        host="0.0.0.0",
-        port=PORT,
+        "0.0.0.0",
+        PORT
     )
 
     await site.start()
 
     logger.info(
         "HTTP server started on port %s",
-        PORT,
+        PORT
     )
 
-    return runner
+
+# ============================================================
+# CALLBACK HANDLER
+# ============================================================
+
+async def callback_handler(callback: CallbackQuery):
+
+    data = callback.data or ""
+
+    if data == "home":
+
+        # Сбрасываем состояния
+        waiting_for_file.discard(
+            callback.from_user.id
+        )
+
+        searching_users.discard(
+            callback.from_user.id
+        )
+
+        await show_home(callback)
+        return
+
+    if data == "upload":
+
+        await upload_start(callback)
+        return
+
+    if data == "myfiles":
+
+        await my_files(callback)
+        return
+
+    if data == "search":
+
+        await search_start(callback)
+        return
+
+    if data == "stats":
+
+        await statistics(callback)
+        return
+
+    if data == "help":
+
+        await help_page(callback)
+        return
+
+    if data == "settings":
+
+        await settings(callback)
+        return
+
+    if data.startswith("get:"):
+
+        await get_file(callback)
+        return
+
+    if data.startswith("info:"):
+
+        await info_file(callback)
+        return
+
+    if data.startswith("delete:"):
+
+        await delete_start(callback)
+        return
+
+    if data.startswith("confirm_delete:"):
+
+        await confirm_delete(callback)
+        return
+
+    await callback.answer()
 
 
 # ============================================================
@@ -1497,56 +1570,84 @@ async def start_web_server():
 
 async def main():
 
-    logger.info(
-        "Starting Telegram File Manager..."
-    )
+    logger.info("Starting Telegram File Manager...")
 
     await init_db()
 
-    web_runner = await start_web_server()
+    await start_http_server()
 
-    session = None
-
-    if BOT_API_BASE_URL:
-
-        session = AiohttpSession(
-            api=BOT_API_BASE_URL
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
         )
+    )
 
-    if session:
+    dp = Dispatcher()
 
-        bot = Bot(
-            token=BOT_TOKEN,
-            session=session,
-        )
+    # Commands
+    dp.message.register(
+        cmd_start,
+        Command("start")
+    )
 
-    else:
+    dp.message.register(
+        cmd_myfiles,
+        Command("myfiles")
+    )
 
-        bot = Bot(
-            token=BOT_TOKEN,
-        )
+    dp.message.register(
+        cmd_get,
+        Command("get")
+    )
+
+    dp.message.register(
+        cmd_info,
+        Command("info")
+    )
+
+    dp.message.register(
+        cmd_delete,
+        Command("delete")
+    )
+
+    # Callbacks
+    dp.callback_query.register(
+        callback_handler
+    )
+
+    # Files
+    dp.message.register(
+        handle_file,
+        F.photo
+        | F.video
+        | F.audio
+        | F.voice
+        | F.animation
+        | F.document
+    )
+
+    # Text
+    dp.message.register(
+        handle_text,
+        F.text
+    )
+
+    logger.info("Telegram bot started")
+    logger.info("Start polling")
 
     try:
 
-        logger.info(
-            "Telegram bot started"
-        )
-
         await dp.start_polling(
             bot,
-            allowed_updates=dp.resolve_used_update_types(),
+            allowed_updates=dp.resolve_used_update_types()
         )
 
     finally:
 
         await bot.session.close()
 
-        if web_runner:
-
-            await web_runner.cleanup()
-
         if db_pool:
-
             await db_pool.close()
 
 
@@ -1556,4 +1657,9 @@ async def main():
 
 if __name__ == "__main__":
 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        logger.info("Bot stopped")
