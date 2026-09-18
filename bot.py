@@ -1,29 +1,38 @@
 import asyncio
 import logging
 import os
+import re
 import secrets
 import string
+from datetime import datetime
 
 import asyncpg
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.client.session.aiohttp import AiohttpSession
 
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"]
+# =========================
+# CONFIG
+# =========================
 
-# Для Local Bot API:
-BOT_API_BASE_URL = os.getenv(
-    "BOT_API_BASE_URL",
-    "http://telegram-local-api:8081"
-)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Официальный лимит Local Bot API
-MAX_FILE_SIZE = 2_000_000_000
+BOT_API_BASE_URL = os.getenv("BOT_API_BASE_URL")
+
+PORT = int(os.getenv("PORT", "10000"))
+
+MAX_FILE_SIZE = 2_000_000_000  # 2 GB
+
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
 
 logging.basicConfig(
@@ -31,571 +40,496 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-dp = Dispatcher()
-pool = None
+logger = logging.getLogger(__name__)
 
 
-def create_code():
-    """
-    Создаёт код вида:
-    A7K2M-91QPX
-    """
+# =========================
+# DATABASE
+# =========================
 
-    alphabet = string.ascii_uppercase + string.digits
-
-    return (
-        "".join(secrets.choice(alphabet) for _ in range(5))
-        + "-"
-        + "".join(secrets.choice(alphabet) for _ in range(5))
-    )
+db_pool: asyncpg.Pool | None = None
 
 
-def create_bot():
+async def init_db():
+    global db_pool
 
-    api = TelegramAPIServer.from_base(
-        BOT_API_BASE_URL.rstrip("/")
-    )
-
-    session = AiohttpSession(api=api)
-
-    return Bot(
-        BOT_TOKEN,
-        session=session,
-        default=DefaultBotProperties(
-            parse_mode="HTML"
-        )
-    )
-
-
-bot = create_bot()
-
-
-async def init_database():
-
-    global pool
-
-    pool = await asyncpg.create_pool(
+    db_pool = await asyncpg.create_pool(
         DATABASE_URL,
         min_size=1,
-        max_size=5
+        max_size=5,
     )
 
-    async with pool.acquire() as conn:
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            tg_id BIGINT PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT NOW()
-        );
-        """)
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            id BIGSERIAL PRIMARY KEY,
-
-            owner_id BIGINT
-                NOT NULL
-                REFERENCES users(tg_id)
-                ON DELETE CASCADE,
-
-            file_id TEXT NOT NULL,
-
-            file_unique_id TEXT,
-
-            file_name TEXT,
-
-            mime_type TEXT,
-
-            file_size BIGINT,
-
-            code TEXT UNIQUE NOT NULL,
-
-            downloads BIGINT
-                NOT NULL DEFAULT 0,
-
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT NOW()
-        );
-        """)
-
-        await conn.execute("""
-        CREATE INDEX IF NOT EXISTS
-        files_owner_index
-        ON files(owner_id);
-        """)
-
-
-async def register_user(message: Message):
-
-    user = message.from_user
-
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                id BIGSERIAL PRIMARY KEY,
+                code VARCHAR(20) UNIQUE NOT NULL,
+                user_id BIGINT NOT NULL,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT,
+                file_name TEXT,
+                file_size BIGINT,
+                mime_type TEXT,
+                downloads INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+            """
+        )
 
         await conn.execute(
             """
-            INSERT INTO users
-            (
-                tg_id,
-                username,
-                first_name
-            )
-            VALUES ($1, $2, $3)
-
-            ON CONFLICT (tg_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name
-            """,
-
-            user.id,
-            user.username,
-            user.first_name
+            CREATE INDEX IF NOT EXISTS idx_files_user_id
+            ON files(user_id);
+            """
         )
 
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_files_code
+            ON files(code);
+            """
+        )
 
-def format_size(size):
-
-    if not size:
-        return "неизвестно"
-
-    if size >= 1024 ** 3:
-        return f"{size / 1024 ** 3:.2f} GB"
-
-    if size >= 1024 ** 2:
-        return f"{size / 1024 ** 2:.2f} MB"
-
-    if size >= 1024:
-        return f"{size / 1024:.2f} KB"
-
-    return f"{size} B"
+    logger.info("Database initialized")
 
 
-@dp.message(CommandStart())
-async def start(message: Message):
+# =========================
+# CODE GENERATOR
+# =========================
 
-    await register_user(message)
+ALPHABET = string.ascii_uppercase + string.digits
 
+
+def generate_code() -> str:
+    part1 = "".join(
+        secrets.choice(ALPHABET)
+        for _ in range(5)
+    )
+
+    part2 = "".join(
+        secrets.choice(ALPHABET)
+        for _ in range(5)
+    )
+
+    return f"{part1}-{part2}"
+
+
+async def create_unique_code() -> str:
+    while True:
+        code = generate_code()
+
+        async with db_pool.acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM files WHERE code = $1",
+                code
+            )
+
+        if not exists:
+            return code
+
+
+# =========================
+# BOT
+# =========================
+
+dp = Dispatcher()
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
     await message.answer(
-        "<b>📁 Telegram File Messenger</b>\n\n"
-
-        "Отправь мне файл — я создам "
-        "уникальный код для него.\n\n"
-
-        "Например:\n"
-        "<code>A7K2M-91QPX</code>\n\n"
-
-        "Другой пользователь сможет получить "
-        "этот файл командой:\n"
-
-        "<code>/get A7K2M-91QPX</code>\n\n"
-
-        "<b>Команды:</b>\n"
-
+        "📁 <b>Файловый менеджер</b>\n\n"
+        "Отправь мне файл, и я сохраню его в системе.\n\n"
+        "Доступные команды:\n"
         "/myfiles — мои файлы\n"
         "/get КОД — получить файл\n"
         "/info КОД — информация о файле\n"
-        "/delete КОД — удалить файл\n"
-        "/help — помощь"
+        "/delete КОД — удалить файл",
+        parse_mode="HTML"
     )
 
 
-@dp.message(Command("help"))
-async def help_command(message: Message):
-
-    await start(message)
-
+# =========================
+# FILE UPLOAD
+# =========================
 
 @dp.message(F.document)
-async def upload_file(message: Message):
-
-    await register_user(message)
+async def handle_document(message: Message, bot: Bot):
 
     document = message.document
 
-    size = document.file_size or 0
-
-    if size > MAX_FILE_SIZE:
-
+    if document.file_size and document.file_size > MAX_FILE_SIZE:
         await message.answer(
-            "❌ Файл слишком большой.\n\n"
-            "Максимальный размер: <b>2000 MB</b>."
+            "❌ Файл слишком большой.\n"
+            "Максимальный размер: 2 ГБ."
         )
-
         return
 
+    await message.answer("⏳ Сохраняю файл...")
 
-    # Генерируем уникальный код
+    code = await create_unique_code()
 
-    for _ in range(20):
-
-        code = create_code()
-
-        try:
-
-            async with pool.acquire() as conn:
-
-                await conn.execute(
-                    """
-                    INSERT INTO files
-                    (
-                        owner_id,
-                        file_id,
-                        file_unique_id,
-                        file_name,
-                        mime_type,
-                        file_size,
-                        code
-                    )
-
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5,
-                        $6,
-                        $7
-                    )
-                    """,
-
-                    message.from_user.id,
-
-                    document.file_id,
-
-                    document.file_unique_id,
-
-                    document.file_name,
-
-                    document.mime_type,
-
-                    size,
-
-                    code
-                )
-
-            break
-
-        except asyncpg.UniqueViolationError:
-
-            continue
-
-    else:
-
-        await message.answer(
-            "❌ Не удалось создать код."
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO files (
+                code,
+                user_id,
+                file_id,
+                file_unique_id,
+                file_name,
+                file_size,
+                mime_type
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            """,
+            code,
+            message.from_user.id,
+            document.file_id,
+            document.file_unique_id,
+            document.file_name,
+            document.file_size,
+            document.mime_type
         )
 
-        return
-
+    size_mb = (
+        document.file_size / 1024 / 1024
+        if document.file_size
+        else 0
+    )
 
     await message.answer(
-        "✅ <b>Файл сохранён!</b>\n\n"
-
-        f"📄 <b>{document.file_name or 'Без имени'}</b>\n"
-
-        f"📦 Размер: {format_size(size)}\n\n"
-
+        "✅ <b>Файл сохранён</b>\n\n"
+        f"📄 Имя: <code>{document.file_name}</code>\n"
+        f"📦 Размер: {size_mb:.2f} MB\n\n"
         f"🔑 Код файла:\n"
         f"<code>{code}</code>\n\n"
-
-        "Передай этот код другому пользователю.\n\n"
-
-        f"Получение:\n"
-        f"<code>/get {code}</code>"
+        "Чтобы получить файл:\n"
+        f"<code>/get {code}</code>",
+        parse_mode="HTML"
     )
 
+
+# =========================
+# GET FILE
+# =========================
 
 @dp.message(Command("get"))
-async def get_file(message: Message):
+async def cmd_get(message: Message, bot: Bot):
 
-    await register_user(message)
+    args = message.text.split(maxsplit=1)
 
-    parts = message.text.split(
-        maxsplit=1
-    )
-
-    if len(parts) != 2:
-
+    if len(args) < 2:
         await message.answer(
             "Использование:\n"
-            "<code>/get A7K2M-91QPX</code>"
+            "<code>/get A7K2M-91QPX</code>",
+            parse_mode="HTML"
         )
-
         return
 
+    code = args[1].strip().upper()
 
-    code = parts[1].strip().upper()
-
-
-    async with pool.acquire() as conn:
-
-        file = await conn.fetchrow(
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
             """
-            SELECT
-                file_id,
-                file_name,
-                file_size
+            SELECT *
             FROM files
             WHERE code = $1
             """,
-
             code
         )
 
-
-    if not file:
-
-        await message.answer(
-            "❌ Файл с таким кодом не найден."
-        )
-
+    if not row:
+        await message.answer("❌ Файл с таким кодом не найден.")
         return
 
-
-    await message.answer(
-        "⏳ Отправляю файл..."
-    )
-
-
     try:
-
         await bot.send_document(
-            chat_id=message.chat.id,
-
-            document=file["file_id"],
-
+            message.chat.id,
+            row["file_id"],
             caption=(
-                f"📁 {file['file_name'] or 'Файл'}\n"
-                f"🔑 <code>{code}</code>"
+                f"📄 {row['file_name'] or 'Файл'}\n"
+                f"🔑 Код: {row['code']}"
             )
         )
 
-
-        async with pool.acquire() as conn:
-
+        async with db_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE files
                 SET downloads = downloads + 1
                 WHERE code = $1
                 """,
-
                 code
             )
 
-
-    except Exception:
-
-        logging.exception(
-            "Ошибка отправки файла"
-        )
+    except Exception as e:
+        logger.exception("Failed to send file: %s", e)
 
         await message.answer(
             "❌ Не удалось отправить файл."
         )
 
 
+# =========================
+# MY FILES
+# =========================
+
 @dp.message(Command("myfiles"))
-async def my_files(message: Message):
+async def cmd_myfiles(message: Message):
 
-    await register_user(message)
-
-    async with pool.acquire() as conn:
-
-        files = await conn.fetch(
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
             """
             SELECT
-                file_name,
-                file_size,
                 code,
-                downloads
-            FROM files
-            WHERE owner_id = $1
-            ORDER BY created_at DESC
-            LIMIT 50
-            """,
-
-            message.from_user.id
-        )
-
-
-    if not files:
-
-        await message.answer(
-            "📂 У тебя пока нет файлов."
-        )
-
-        return
-
-
-    result = [
-        "<b>📂 Твои файлы:</b>\n"
-    ]
-
-
-    for file in files:
-
-        result.append(
-            f"📄 <b>{file['file_name'] or 'Без имени'}</b>\n"
-            f"📦 {format_size(file['file_size'])}\n"
-            f"🔑 <code>{file['code']}</code>\n"
-            f"📥 Скачиваний: {file['downloads']}"
-        )
-
-
-    await message.answer(
-        "\n\n".join(result)
-    )
-
-
-@dp.message(Command("info"))
-async def file_info(message: Message):
-
-    await register_user(message)
-
-    parts = message.text.split(
-        maxsplit=1
-    )
-
-    if len(parts) != 2:
-
-        await message.answer(
-            "Использование:\n"
-            "<code>/info КОД</code>"
-        )
-
-        return
-
-
-    code = parts[1].strip().upper()
-
-
-    async with pool.acquire() as conn:
-
-        file = await conn.fetchrow(
-            """
-            SELECT
                 file_name,
                 file_size,
-                mime_type,
                 downloads,
                 created_at
             FROM files
-            WHERE code = $1
+            WHERE user_id = $1
+            ORDER BY created_at DESC
             """,
-
-            code
-        )
-
-
-    if not file:
-
-        await message.answer(
-            "❌ Файл не найден."
-        )
-
-        return
-
-
-    await message.answer(
-        "<b>📄 Информация</b>\n\n"
-
-        f"Имя: "
-        f"<code>{file['file_name'] or 'Без имени'}</code>\n"
-
-        f"Размер: "
-        f"{format_size(file['file_size'])}\n"
-
-        f"Тип: "
-        f"{file['mime_type'] or 'неизвестно'}\n"
-
-        f"Скачиваний: "
-        f"{file['downloads']}\n"
-
-        f"Код: "
-        f"<code>{code}</code>"
-    )
-
-
-@dp.message(Command("delete"))
-async def delete_file(message: Message):
-
-    await register_user(message)
-
-    parts = message.text.split(
-        maxsplit=1
-    )
-
-    if len(parts) != 2:
-
-        await message.answer(
-            "Использование:\n"
-            "<code>/delete КОД</code>"
-        )
-
-        return
-
-
-    code = parts[1].strip().upper()
-
-
-    async with pool.acquire() as conn:
-
-        result = await conn.execute(
-            """
-            DELETE FROM files
-
-            WHERE code = $1
-            AND owner_id = $2
-            """,
-
-            code,
             message.from_user.id
         )
 
-
-    if result == "DELETE 0":
-
+    if not rows:
         await message.answer(
-            "❌ Файл не найден "
-            "или он тебе не принадлежит."
+            "📂 У тебя пока нет сохранённых файлов."
+        )
+        return
+
+    text = "📂 <b>Твои файлы</b>\n\n"
+
+    for row in rows[:50]:
+
+        size_mb = (
+            row["file_size"] / 1024 / 1024
+            if row["file_size"]
+            else 0
         )
 
-    else:
-
-        await message.answer(
-            "🗑 Файл удалён из каталога."
+        text += (
+            f"📄 <b>{row['file_name'] or 'Без имени'}</b>\n"
+            f"🔑 <code>{row['code']}</code>\n"
+            f"📦 {size_mb:.2f} MB\n"
+            f"⬇️ Скачиваний: {row['downloads']}\n\n"
         )
 
+    if len(rows) > 50:
+        text += "Показаны последние 50 файлов."
+
+    await message.answer(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================
+# INFO
+# =========================
+
+@dp.message(Command("info"))
+async def cmd_info(message: Message):
+
+    args = message.text.split(maxsplit=1)
+
+    if len(args) < 2:
+        await message.answer(
+            "Использование:\n"
+            "<code>/info КОД</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    code = args[1].strip().upper()
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM files
+            WHERE code = $1
+            """,
+            code
+        )
+
+    if not row:
+        await message.answer("❌ Файл не найден.")
+        return
+
+    size_mb = (
+        row["file_size"] / 1024 / 1024
+        if row["file_size"]
+        else 0
+    )
+
+    await message.answer(
+        "ℹ️ <b>Информация о файле</b>\n\n"
+        f"📄 Имя: <code>{row['file_name'] or 'Без имени'}</code>\n"
+        f"🔑 Код: <code>{row['code']}</code>\n"
+        f"📦 Размер: {size_mb:.2f} MB\n"
+        f"⬇️ Скачиваний: {row['downloads']}\n"
+        f"📅 Загружен: {row['created_at']}",
+        parse_mode="HTML"
+    )
+
+
+# =========================
+# DELETE
+# =========================
+
+@dp.message(Command("delete"))
+async def cmd_delete(message: Message):
+
+    args = message.text.split(maxsplit=1)
+
+    if len(args) < 2:
+        await message.answer(
+            "Использование:\n"
+            "<code>/delete КОД</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    code = args[1].strip().upper()
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM files
+            WHERE code = $1
+            """,
+            code
+        )
+
+        if not row:
+            await message.answer(
+                "❌ Файл не найден."
+            )
+            return
+
+        if row["user_id"] != message.from_user.id:
+            await message.answer(
+                "❌ Ты не можешь удалить этот файл."
+            )
+            return
+
+        await conn.execute(
+            """
+            DELETE FROM files
+            WHERE code = $1
+            """,
+            code
+        )
+
+    await message.answer(
+        "🗑 Файл удалён."
+    )
+
+
+# =========================
+# HEALTH SERVER
+# =========================
+
+async def health(request):
+    return web.json_response(
+        {
+            "status": "ok",
+            "service": "telegram-file-messenger",
+            "time": datetime.utcnow().isoformat()
+        }
+    )
+
+
+async def root(request):
+    return web.json_response(
+        {
+            "status": "running",
+            "service": "Telegram File Manager"
+        }
+    )
+
+
+async def start_web_server():
+
+    app = web.Application()
+
+    app.router.add_get("/", root)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        host="0.0.0.0",
+        port=PORT
+    )
+
+    await site.start()
+
+    logger.info(
+        "HTTP server started on port %s",
+        PORT
+    )
+
+    return runner
+
+
+# =========================
+# MAIN
+# =========================
 
 async def main():
 
-    await init_database()
+    logger.info("Starting Telegram File Manager...")
 
-    me = await bot.get_me()
+    await init_db()
 
-    logging.info(
-        "Bot started: @%s",
-        me.username
-    )
+    web_runner = await start_web_server()
+
+    session = None
+
+    if BOT_API_BASE_URL:
+        session = AiohttpSession(
+            api=BOT_API_BASE_URL
+        )
+
+    if session:
+        bot = Bot(
+            token=BOT_TOKEN,
+            session=session
+        )
+    else:
+        bot = Bot(
+            token=BOT_TOKEN
+        )
 
     try:
 
-        await dp.start_polling(bot)
+        logger.info("Bot started")
+
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types()
+        )
 
     finally:
 
         await bot.session.close()
 
-        if pool:
+        if web_runner:
+            await web_runner.cleanup()
 
-            await pool.close()
+        if db_pool:
+            await db_pool.close()
 
 
 if __name__ == "__main__":
-
     asyncio.run(main())
